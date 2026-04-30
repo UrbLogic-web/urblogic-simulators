@@ -1,0 +1,2081 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ABM Traffic Simulator v2.3 — Service Deficit Impact on Arterial Traffic</title>
+  <meta name="description" content="Agent-Based Model simulating the impact of school service deficits on arterial traffic in Saudi urban districts. PhD research tool for AI and Advanced Urban Information Systems." />
+  <meta name="author" content="urblogic.com" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-type="module">
+    const { useState, useRef, useEffect, useCallback } = React;
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   ABM TRAFFIC SIMULATOR v2.2
+   Service Deficit Impact on Arterial Traffic — Saudi Urban Districts
+   
+   MODEL OVERVIEW:
+   Simulates morning school-trip traffic (5:30–8:00 AM) across a 3×3 grid of
+   urban districts. Each district is 2km × 2km. Households generate car trips
+   to schools (6 types: Elementary/Middle/Secondary × Boys/Girls). When a
+   district lacks a needed school type, families must cross arterial roads to
+   reach adjacent districts, increasing main-street congestion.
+
+   KEY ALGORITHMS:
+   - F_buildNetwork():  Constructs dual-lane divided arterial road graph
+   - F_dijkstra():      Shortest path with congestion-weighted edges
+   - F_initSim():       Generates households, assigns schools, builds routes
+   - F_stepSim():       Advances simulation by 1 tick (15 real seconds)
+   - F_render():        Draws map, cars, traffic lights on canvas
+
+   NAMING CONVENTION:
+   P_  = Parameter (user-controlled via sliders/toggles)
+   V_  = Variable (internal simulation state)
+   F_  = Function
+   C_  = Class / data structure
+   S_  = Statistic (output metric)
+   N_  = Network element (node, edge, adjacency)
+
+   CONGESTION MODEL:
+   Greenshields-style speed-flow: speed = P_freeSpeed × max(0.28, 1 - occ × 0.72)
+   where occ = cars_on_segment / segment_capacity. No external libraries used.
+
+   DEPARTURE TIME MODEL:
+   Truncated normal distribution. Mean = back-calculated from school start time.
+   Elementary ~6:15, Middle ~6:30, Secondary ~6:45 AM departure.
+   Variance adjusted by number of children (more kids → earlier, tighter spread).
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* ─────────────────────────────────────────────
+   CONSTANTS: World geometry & calibration
+   ───────────────────────────────────────────── */
+
+const P_DIST_KM       = 2;        // Real-world district side length in km
+const P_DIST_PX       = 140;      // Pixels per district side
+const P_M_PER_PX      = (P_DIST_KM * 1000) / P_DIST_PX;  // Meters per pixel (~14.3)
+const P_ARTERIAL_W    = 26;       // Pixel width of arterial road gap between districts
+const P_GRID_SIZE     = 3;        // 3×3 grid of districts
+const P_INT_BLOCKS    = 4;        // Internal blocks per district side (creates 4×4 block grid)
+const P_CELL_PX       = P_DIST_PX / P_INT_BLOCKS;  // Pixel size of one internal block
+const P_WORLD_PX      = P_DIST_PX * P_GRID_SIZE + P_ARTERIAL_W * (P_GRID_SIZE - 1); // Inner grid size in px
+const P_RING_W        = P_ARTERIAL_W;  // Ring road width = same as internal arterials
+const P_TOTAL_PX      = P_WORLD_PX + 2 * P_RING_W; // Total world including ring road
+
+/* ─────────────────────────────────────────────
+   CONSTANTS: Time calibration
+   5:30 AM to 8:00 AM = 150 minutes = 600 ticks
+   ───────────────────────────────────────────── */
+
+const P_TICK_SECONDS   = 15;      // Each simulation tick = 15 real seconds
+const P_TOTAL_TICKS    = 600;     // Total ticks in simulation (150 min ÷ 0.25 min/tick)
+const P_START_HOUR     = 5.5;     // Simulation starts at 5:30 AM (decimal hours)
+
+/* School start times in ticks (used for departure time calculation)
+   Elementary: 6:30 AM = tick 240, Middle: 6:45 AM = tick 300, Secondary: 7:00 AM = tick 360 */
+const P_SCHOOL_START_TICKS = { E: 240, M: 300, S: 360 };
+
+/* ─────────────────────────────────────────────
+   CONSTANTS: Speed calibration
+   Free-flow: 35 km/h, minimum under congestion: ~10 km/h
+   ───────────────────────────────────────────── */
+
+const P_FREE_SPEED_KMH   = 35;
+const P_FREE_SPEED_PX    = (P_FREE_SPEED_KMH * 1000 / 3600) * P_TICK_SECONDS / P_M_PER_PX; // ~11 px/tick
+const P_MIN_SPEED_FACTOR = 0.28;  // Speed drops to 28% of free-flow at max congestion (~10 km/h)
+
+/* ─────────────────────────────────────────────
+   CONSTANTS: Road capacity
+   Arterial segments hold more cars than internal streets
+   ───────────────────────────────────────────── */
+
+const P_ARTERIAL_CAPACITY = 18;   // Max cars per arterial segment before full congestion
+const P_INTERNAL_CAPACITY = 6;    // Max cars per internal street segment
+const P_CAR_RADIUS_PX     = 1.5;  // Visual radius of car dots (scaled closer to reality)
+
+/* ─────────────────────────────────────────────
+   CONSTANTS: School types (Saudi system)
+   6 types: 3 stages × 2 genders
+   ───────────────────────────────────────────── */
+
+const C_SCHOOL_TYPES  = ["EB", "EG", "MB", "MG", "SB", "SG"];
+const C_SCHOOL_LABELS = {
+  EB: "Elem Boys",  EG: "Elem Girls",
+  MB: "Mid Boys",   MG: "Mid Girls",
+  SB: "Sec Boys",   SG: "Sec Girls"
+};
+const C_SCHOOL_COLORS = {
+  EB: "#2563eb", EG: "#db2777",
+  MB: "#0891b2", MG: "#a855f7",
+  SB: "#059669", SG: "#e11d48"
+};
+
+/* ─────────────────────────────────────────────
+   SEEDED PRNG (Mulberry32)
+   Allows reproducible simulation runs for testing.
+   Module-level so all utility functions can access it.
+   ───────────────────────────────────────────── */
+
+const V_rng = {
+  _state: 0,
+  /** Seed the PRNG. Call before each F_initSim. */
+  seed(s) {
+    this._state = s | 0;
+  },
+  /** Return next float in [0, 1). Mulberry32 algorithm. */
+  next() {
+    let t = (this._state += 0x6D2B79F5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+};
+
+// Initialize with a random seed so first load works before any explicit seeding
+V_rng.seed(Date.now());
+
+/* ─────────────────────────────────────────────
+   UTILITY FUNCTIONS
+   All randomness routes through V_rng.next()
+   ───────────────────────────────────────────── */
+
+/** F_randInt: Random integer in range [min, max] inclusive */
+const F_randInt = (min, max) => Math.floor(V_rng.next() * (max - min + 1)) + min;
+
+/** F_pickRandom: Pick a random element from an array */
+const F_pickRandom = (arr) => arr[Math.floor(V_rng.next() * arr.length)];
+
+/** F_manhattanDist: Manhattan distance between two nodes */
+const F_manhattanDist = (a, b) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+
+/** F_euclideanDist: Euclidean distance between two nodes */
+const F_euclideanDist = (a, b) => Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+
+/** F_tickToTimeStr: Convert simulation tick to "H:MM" time string */
+const F_tickToTimeStr = (tick) => {
+  const totalMinutes = P_START_HOUR * 60 + tick * (P_TICK_SECONDS / 60);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = Math.floor(totalMinutes % 60);
+  return `${hours}:${String(minutes).padStart(2, "0")}`;
+};
+
+/** F_normalRandom: Box-Muller transform to generate normally distributed random number
+ *  Returns a value from Normal(mean, stdDev), clamped to [min, max] */
+const F_normalRandom = (mean, stdDev, min, max) => {
+  let u1 = V_rng.next();
+  let u2 = V_rng.next();
+  if (u1 === 0) u1 = 0.0001; // Avoid log(0)
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  const value = mean + z * stdDev;
+  return Math.max(min, Math.min(max, Math.round(value)));
+};
+
+/** F_logNormalTick: Generate a departure tick from a log-normal distribution.
+ *  Uses Box-Muller → exponentiate to produce right-skewed timing.
+ *  mu=0, sigma=0.7 gives a natural morning-rush shape.
+ *  Result clamped to [0, maxTick]. */
+const F_logNormalTick = (maxTick) => {
+  let u1 = V_rng.next();
+  let u2 = V_rng.next();
+  if (u1 === 0) u1 = 0.0001;
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  const raw = Math.exp(0 + 0.7 * z);  // LogNormal(0, 0.7): median ≈ 1, right-skewed
+  // Normalize: map [~0.05, ~8] → [0, 1] then scale to maxTick
+  const normalized = Math.max(0, Math.min(1, (raw - 0.05) / 7.5));
+  return Math.round(normalized * maxTick);
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   F_buildNetwork()
+   
+   Constructs the complete road graph for a 3×3 grid of districts.
+   
+   STRUCTURE:
+   - Each district has an internal 4×4 grid of streets (N_internalNodes)
+   - Between adjacent districts: divided arterial road with 2 lanes + median
+   - At arterial intersections: U-turn / crossing nodes (N_intersectionNodes)
+   - Grid boundary nodes marked as exit points (for work-bound trips)
+   
+   RETURNS: { N_nodes[], N_edges[], N_adjacency[][], N_edgeLookup{}, N_districtNodes{} }
+   ═══════════════════════════════════════════════════════════════════════════════ */
+function F_buildNetwork() {
+  const N_nodes = [];
+  const N_edges = [];
+  const N_nodeMap = {};  // Key: "x*10,y*10" → node (for deduplication)
+  let V_nextNodeId = 0;
+
+  /** Add a node at (x,y) with optional properties. Returns existing node if one exists at same position. */
+  const F_addNode = (x, y, props = {}) => {
+    const key = `${Math.round(x * 10)},${Math.round(y * 10)}`;
+    if (N_nodeMap[key]) return N_nodeMap[key];
+    const node = { id: V_nextNodeId++, x, y, key, ...props };
+    N_nodes.push(node);
+    N_nodeMap[key] = node;
+    return node;
+  };
+
+  /** Add an edge between nodes a and b. If directed=true, only a→b is traversable. */
+  const F_addEdge = (a, b, type = "internal", directed = false) => {
+    if (a.id === b.id) return null;
+    // For directed: only check a→b. For undirected: check both directions.
+    const exists = directed
+      ? N_edges.find(e => e.a.id === a.id && e.b.id === b.id)
+      : N_edges.find(e => (e.a.id === a.id && e.b.id === b.id) || (e.a.id === b.id && e.b.id === a.id));
+    if (exists) return null;
+    const edge = {
+      a, b, type, directed,
+      length: F_euclideanDist(a, b),
+      capacity: type === "arterial" ? P_ARTERIAL_CAPACITY : P_INTERNAL_CAPACITY,
+      V_currentCars: 0
+    };
+    N_edges.push(edge);
+    return edge;
+  };
+
+  /* ── Step 1: Create internal street grids for each district ── */
+  const N_districtNodes = {};  // { districtId: [node, ...] }
+  for (let distRow = 0; distRow < P_GRID_SIZE; distRow++) {
+    for (let distCol = 0; distCol < P_GRID_SIZE; distCol++) {
+      const districtId = distRow * P_GRID_SIZE + distCol;
+      N_districtNodes[districtId] = [];
+      const originX = distCol * (P_DIST_PX + P_ARTERIAL_W);
+      const originY = distRow * (P_DIST_PX + P_ARTERIAL_W);
+
+      // Create (P_INT_BLOCKS+1) × (P_INT_BLOCKS+1) grid of intersection nodes
+      for (let row = 0; row <= P_INT_BLOCKS; row++) {
+        for (let col = 0; col <= P_INT_BLOCKS; col++) {
+          const node = F_addNode(
+            originX + col * P_CELL_PX,
+            originY + row * P_CELL_PX,
+            { districtId, nodeType: "internal" }
+          );
+          N_districtNodes[districtId].push(node);
+
+          // Connect to left neighbor (horizontal internal street)
+          if (col > 0) {
+            const leftKey = `${Math.round((originX + (col - 1) * P_CELL_PX) * 10)},${Math.round((originY + row * P_CELL_PX) * 10)}`;
+            if (N_nodeMap[leftKey]) F_addEdge(N_nodeMap[leftKey], node);
+          }
+          // Connect to top neighbor (vertical internal street)
+          if (row > 0) {
+            const topKey = `${Math.round((originX + col * P_CELL_PX) * 10)},${Math.round((originY + (row - 1) * P_CELL_PX) * 10)}`;
+            if (N_nodeMap[topKey]) F_addEdge(N_nodeMap[topKey], node);
+          }
+        }
+      }
+    }
+  }
+
+  /* ── Step 2: Create divided arterial lane nodes ──
+     Each arterial gap has TWO lanes (left/right or top/bottom) separated by a median.
+     Cars enter from their district side, travel along their lane, and can only
+     cross to the other lane at intersection nodes (U-turn points). */
+
+  const N_arterialLanes = { vertical: {}, horizontal: {} };
+
+  // Vertical arterials (between column 0-1 and column 1-2)
+  for (let artCol = 0; artCol < P_GRID_SIZE - 1; artCol++) {
+    const artStartX = artCol * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX;
+    const leftLaneX = artStartX + P_ARTERIAL_W * 0.28;   // Left lane center
+    const rightLaneX = artStartX + P_ARTERIAL_W * 0.72;  // Right lane center
+    N_arterialLanes.vertical[artCol] = { left: [], right: [] };
+
+    for (let distRow = 0; distRow < P_GRID_SIZE; distRow++) {
+      const originY = distRow * (P_DIST_PX + P_ARTERIAL_W);
+      for (let row = 0; row <= P_INT_BLOCKS; row++) {
+        const y = originY + row * P_CELL_PX;
+
+        // Create left and right lane nodes at this y-position
+        const leftNode = F_addNode(leftLaneX, y, { nodeType: "arterial_lane" });
+        const rightNode = F_addNode(rightLaneX, y, { nodeType: "arterial_lane" });
+        N_arterialLanes.vertical[artCol].left.push(leftNode);
+        N_arterialLanes.vertical[artCol].right.push(rightNode);
+
+        // Connect to previous lane node (along the arterial)
+        // Saudi right-hand traffic: left lane = southbound, right lane = northbound
+        const prevIdx = N_arterialLanes.vertical[artCol].left.length - 2;
+        if (prevIdx >= 0) {
+          // Left lane southbound: prev (north) → current (south)
+          F_addEdge(N_arterialLanes.vertical[artCol].left[prevIdx], leftNode, "arterial", true);
+          // Right lane northbound: current (south) → prev (north)
+          F_addEdge(rightNode, N_arterialLanes.vertical[artCol].right[prevIdx], "arterial", true);
+        }
+
+        // Connect left lane to left district's border node
+        const leftBorderKey = `${Math.round(artStartX * 10)},${Math.round(y * 10)}`;
+        if (N_nodeMap[leftBorderKey]) F_addEdge(N_nodeMap[leftBorderKey], leftNode, "arterial");
+
+        // Connect right lane to right district's border node
+        const rightDistOriginX = (artCol + 1) * (P_DIST_PX + P_ARTERIAL_W);
+        const rightBorderKey = `${Math.round(rightDistOriginX * 10)},${Math.round(y * 10)}`;
+        if (N_nodeMap[rightBorderKey]) F_addEdge(N_nodeMap[rightBorderKey], rightNode, "arterial");
+      }
+
+      // Add gap-center lane nodes between district rows (where horizontal arterials cross).
+      // These nodes sit INSIDE the arterial gap, separated from district border nodes.
+      // Intersection centers connect to THESE nodes, ensuring cars must approach
+      // from the correct lane direction to reach a turn — no instant shortcuts.
+      if (distRow < P_GRID_SIZE - 1) {
+        const gapCenterY = originY + P_DIST_PX + P_ARTERIAL_W / 2;
+        const gapLeft = F_addNode(leftLaneX, gapCenterY, { nodeType: "arterial_lane" });
+        const gapRight = F_addNode(rightLaneX, gapCenterY, { nodeType: "arterial_lane" });
+        N_arterialLanes.vertical[artCol].left.push(gapLeft);
+        N_arterialLanes.vertical[artCol].right.push(gapRight);
+
+        const prevL = N_arterialLanes.vertical[artCol].left[N_arterialLanes.vertical[artCol].left.length - 2];
+        const prevR = N_arterialLanes.vertical[artCol].right[N_arterialLanes.vertical[artCol].right.length - 2];
+        // SB: prev (district edge, north) → gap center (south)
+        F_addEdge(prevL, gapLeft, "arterial", true);
+        // NB: gap center (south) → prev (district edge, north)
+        F_addEdge(gapRight, prevR, "arterial", true);
+      }
+    }
+  }
+
+  // Horizontal arterials (between row 0-1 and row 1-2)
+  for (let artRow = 0; artRow < P_GRID_SIZE - 1; artRow++) {
+    const artStartY = artRow * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX;
+    const topLaneY = artStartY + P_ARTERIAL_W * 0.28;
+    const bottomLaneY = artStartY + P_ARTERIAL_W * 0.72;
+    N_arterialLanes.horizontal[artRow] = { top: [], bottom: [] };
+
+    for (let distCol = 0; distCol < P_GRID_SIZE; distCol++) {
+      const originX = distCol * (P_DIST_PX + P_ARTERIAL_W);
+      for (let col = 0; col <= P_INT_BLOCKS; col++) {
+        const x = originX + col * P_CELL_PX;
+
+        const topNode = F_addNode(x, topLaneY, { nodeType: "arterial_lane" });
+        const bottomNode = F_addNode(x, bottomLaneY, { nodeType: "arterial_lane" });
+        N_arterialLanes.horizontal[artRow].top.push(topNode);
+        N_arterialLanes.horizontal[artRow].bottom.push(bottomNode);
+
+        // Saudi right-hand traffic: top lane = westbound, bottom lane = eastbound
+        const prevIdx = N_arterialLanes.horizontal[artRow].top.length - 2;
+        if (prevIdx >= 0) {
+          // Top lane westbound: current (east) → prev (west)
+          F_addEdge(topNode, N_arterialLanes.horizontal[artRow].top[prevIdx], "arterial", true);
+          // Bottom lane eastbound: prev (west) → current (east)
+          F_addEdge(N_arterialLanes.horizontal[artRow].bottom[prevIdx], bottomNode, "arterial", true);
+        }
+
+        const topBorderKey = `${Math.round(x * 10)},${Math.round(artStartY * 10)}`;
+        if (N_nodeMap[topBorderKey]) F_addEdge(N_nodeMap[topBorderKey], topNode, "arterial");
+
+        const bottomDistOriginY = (artRow + 1) * (P_DIST_PX + P_ARTERIAL_W);
+        const bottomBorderKey = `${Math.round(x * 10)},${Math.round(bottomDistOriginY * 10)}`;
+        if (N_nodeMap[bottomBorderKey]) F_addEdge(N_nodeMap[bottomBorderKey], bottomNode, "arterial");
+      }
+
+      // Add gap-center lane nodes between district columns (where vertical arterials cross)
+      if (distCol < P_GRID_SIZE - 1) {
+        const gapCenterX = originX + P_DIST_PX + P_ARTERIAL_W / 2;
+        const gapTop = F_addNode(gapCenterX, topLaneY, { nodeType: "arterial_lane" });
+        const gapBottom = F_addNode(gapCenterX, bottomLaneY, { nodeType: "arterial_lane" });
+        N_arterialLanes.horizontal[artRow].top.push(gapTop);
+        N_arterialLanes.horizontal[artRow].bottom.push(gapBottom);
+
+        const prevT = N_arterialLanes.horizontal[artRow].top[N_arterialLanes.horizontal[artRow].top.length - 2];
+        const prevB = N_arterialLanes.horizontal[artRow].bottom[N_arterialLanes.horizontal[artRow].bottom.length - 2];
+        // WB: current gap (east) → prev district edge (west)
+        F_addEdge(gapTop, prevT, "arterial", true);
+        // EB: prev district edge (west) → current gap (east)
+        F_addEdge(prevB, gapBottom, "arterial", true);
+      }
+    }
+  }
+
+  /* ── Step 3: Create intersection nodes where arterials cross ──
+     Center node connects to gap-center lane nodes (NOT district border nodes).
+     Cars must approach along the lane in the correct direction to reach the
+     intersection — no instant shortcuts from adjacent district borders.
+     U-turns are allowed at all intersections. */
+  for (let artRow = 0; artRow < P_GRID_SIZE - 1; artRow++) {
+    for (let artCol = 0; artCol < P_GRID_SIZE - 1; artCol++) {
+      const intersectX = artCol * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+      const intersectY = artRow * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+      const centerNode = F_addNode(intersectX, intersectY, { nodeType: "intersection" });
+
+      // Find nearest lane nodes — these will be the gap-center nodes
+      const F_findNearest = (laneArray, coord, useX) => {
+        let best = null, bestDist = Infinity;
+        laneArray.forEach(n => {
+          const d = Math.abs(useX ? n.x - coord : n.y - coord);
+          if (d < bestDist) { bestDist = d; best = n; }
+        });
+        return best;
+      };
+
+      const vertLeft = F_findNearest(N_arterialLanes.vertical[artCol]?.left || [], intersectY, false);
+      const vertRight = F_findNearest(N_arterialLanes.vertical[artCol]?.right || [], intersectY, false);
+      const horizTop = F_findNearest(N_arterialLanes.horizontal[artRow]?.top || [], intersectX, true);
+      const horizBottom = F_findNearest(N_arterialLanes.horizontal[artRow]?.bottom || [], intersectX, true);
+
+      // Connect all lane nodes to center (allows turns)
+      [vertLeft, vertRight, horizTop, horizBottom].forEach(n => {
+        if (n) {
+          F_addEdge(n, centerNode, "arterial");
+          n.trafficLightControlled = true;
+        }
+      });
+      // U-turn connections (opposing lanes)
+      if (vertLeft && vertRight) F_addEdge(vertLeft, vertRight, "arterial");
+      if (horizTop && horizBottom) F_addEdge(horizTop, horizBottom, "arterial");
+    }
+  }
+
+  /* ── Step 4: Ring arterial road around grid perimeter ──
+     Dual-lane ring road following right-hand traffic. Connects to existing
+     arterial endpoints and district borders. Enables U-turns and perimeter routing. */
+
+  // Collect sorted x/y positions matching existing grid nodes
+  const V_ringX = [];
+  for (let dc = 0; dc < P_GRID_SIZE; dc++)
+    for (let c = 0; c <= P_INT_BLOCKS; c++)
+      V_ringX.push(dc * (P_DIST_PX + P_ARTERIAL_W) + c * P_CELL_PX);
+  for (let ac = 0; ac < P_GRID_SIZE - 1; ac++) {
+    const ax = ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX;
+    V_ringX.push(ax + P_ARTERIAL_W * 0.28, ax + P_ARTERIAL_W * 0.72);
+  }
+  V_ringX.sort((a, b) => a - b);
+
+  const V_ringY = [];
+  for (let dr = 0; dr < P_GRID_SIZE; dr++)
+    for (let r = 0; r <= P_INT_BLOCKS; r++)
+      V_ringY.push(dr * (P_DIST_PX + P_ARTERIAL_W) + r * P_CELL_PX);
+  for (let ar = 0; ar < P_GRID_SIZE - 1; ar++) {
+    const ay = ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX;
+    V_ringY.push(ay + P_ARTERIAL_W * 0.28, ay + P_ARTERIAL_W * 0.72);
+  }
+  V_ringY.sort((a, b) => a - b);
+
+  // Helper: create one horizontal ring edge (WB + EB lanes)
+  const F_buildHorizRing = (wbY, ebY, gridEdgeY) => {
+    const wbNodes = [], ebNodes = [];
+    V_ringX.forEach((x, i) => {
+      const wb = F_addNode(x, wbY, { nodeType: "arterial_lane" });
+      const eb = F_addNode(x, ebY, { nodeType: "arterial_lane" });
+      wbNodes.push(wb); ebNodes.push(eb);
+      if (i > 0) {
+        F_addEdge(wb, wbNodes[i - 1], "arterial", true);    // westbound: right→left
+        F_addEdge(ebNodes[i - 1], eb, "arterial", true);     // eastbound: left→right
+      }
+      // Connect to existing grid boundary node
+      const bKey = `${Math.round(x * 10)},${Math.round(gridEdgeY * 10)}`;
+      if (N_nodeMap[bKey]) {
+        F_addEdge(N_nodeMap[bKey], wb, "arterial");
+        F_addEdge(N_nodeMap[bKey], eb, "arterial");
+      }
+    });
+    return { wbNodes, ebNodes };
+  };
+
+  // Helper: create one vertical ring edge (SB + NB lanes)
+  const F_buildVertRing = (sbX, nbX, gridEdgeX) => {
+    const sbNodes = [], nbNodes = [];
+    V_ringY.forEach((y, i) => {
+      const sb = F_addNode(sbX, y, { nodeType: "arterial_lane" });
+      const nb = F_addNode(nbX, y, { nodeType: "arterial_lane" });
+      sbNodes.push(sb); nbNodes.push(nb);
+      if (i > 0) {
+        F_addEdge(sbNodes[i - 1], sb, "arterial", true);     // southbound: top→bottom
+        F_addEdge(nb, nbNodes[i - 1], "arterial", true);      // northbound: bottom→top
+      }
+      const bKey = `${Math.round(gridEdgeX * 10)},${Math.round(y * 10)}`;
+      if (N_nodeMap[bKey]) {
+        F_addEdge(N_nodeMap[bKey], sb, "arterial");
+        F_addEdge(N_nodeMap[bKey], nb, "arterial");
+      }
+    });
+    return { sbNodes, nbNodes };
+  };
+
+  // Create 4 ring road edges
+  const northRing = F_buildHorizRing(-P_RING_W * 0.72, -P_RING_W * 0.28, 0);
+  const southRing = F_buildHorizRing(P_WORLD_PX + P_RING_W * 0.28, P_WORLD_PX + P_RING_W * 0.72, P_WORLD_PX);
+  const westRing  = F_buildVertRing(-P_RING_W * 0.72, -P_RING_W * 0.28, 0);
+  const eastRing  = F_buildVertRing(P_WORLD_PX + P_RING_W * 0.28, P_WORLD_PX + P_RING_W * 0.72, P_WORLD_PX);
+
+  // Ring-arterial intersections: where existing arterials meet the ring road
+  const F_findClosest = (arr, val, useX) =>
+    arr.reduce((best, n) => Math.abs((useX ? n.x : n.y) - val) < Math.abs((useX ? best.x : best.y) - val) ? n : best, arr[0]);
+
+  // N/S edges × vertical arterials
+  for (let ac = 0; ac < P_GRID_SIZE - 1; ac++) {
+    const cx = ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+    // North intersection
+    const nCenter = F_addNode(cx, -P_RING_W / 2, { nodeType: "intersection" });
+    [F_findClosest(northRing.wbNodes, cx, true), F_findClosest(northRing.ebNodes, cx, true)].forEach(n => {
+      if (n) { F_addEdge(n, nCenter, "arterial"); n.trafficLightControlled = true; }
+    });
+    // Connect vertical arterial lane endpoints at y=0 to this intersection
+    const lKey = `${Math.round((ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W * 0.28) * 10)},0`;
+    const rKey = `${Math.round((ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W * 0.72) * 10)},0`;
+    [N_nodeMap[lKey], N_nodeMap[rKey]].forEach(n => {
+      if (n) { F_addEdge(n, nCenter, "arterial"); n.trafficLightControlled = true; }
+    });
+
+    // South intersection
+    const sCenter = F_addNode(cx, P_WORLD_PX + P_RING_W / 2, { nodeType: "intersection" });
+    [F_findClosest(southRing.wbNodes, cx, true), F_findClosest(southRing.ebNodes, cx, true)].forEach(n => {
+      if (n) { F_addEdge(n, sCenter, "arterial"); n.trafficLightControlled = true; }
+    });
+    const slKey = `${Math.round((ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W * 0.28) * 10)},${Math.round(P_WORLD_PX * 10)}`;
+    const srKey = `${Math.round((ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W * 0.72) * 10)},${Math.round(P_WORLD_PX * 10)}`;
+    [N_nodeMap[slKey], N_nodeMap[srKey]].forEach(n => {
+      if (n) { F_addEdge(n, sCenter, "arterial"); n.trafficLightControlled = true; }
+    });
+  }
+
+  // E/W edges × horizontal arterials
+  for (let ar = 0; ar < P_GRID_SIZE - 1; ar++) {
+    const cy = ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+    // West intersection
+    const wCenter = F_addNode(-P_RING_W / 2, cy, { nodeType: "intersection" });
+    [F_findClosest(westRing.sbNodes, cy, false), F_findClosest(westRing.nbNodes, cy, false)].forEach(n => {
+      if (n) { F_addEdge(n, wCenter, "arterial"); n.trafficLightControlled = true; }
+    });
+    const wtKey = `0,${Math.round((ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W * 0.28) * 10)}`;
+    const wbKey = `0,${Math.round((ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W * 0.72) * 10)}`;
+    [N_nodeMap[wtKey], N_nodeMap[wbKey]].forEach(n => {
+      if (n) { F_addEdge(n, wCenter, "arterial"); n.trafficLightControlled = true; }
+    });
+
+    // East intersection
+    const eCenter = F_addNode(P_WORLD_PX + P_RING_W / 2, cy, { nodeType: "intersection" });
+    [F_findClosest(eastRing.sbNodes, cy, false), F_findClosest(eastRing.nbNodes, cy, false)].forEach(n => {
+      if (n) { F_addEdge(n, eCenter, "arterial"); n.trafficLightControlled = true; }
+    });
+    const etKey = `${Math.round(P_WORLD_PX * 10)},${Math.round((ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W * 0.28) * 10)}`;
+    const ebKey = `${Math.round(P_WORLD_PX * 10)},${Math.round((ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W * 0.72) * 10)}`;
+    [N_nodeMap[etKey], N_nodeMap[ebKey]].forEach(n => {
+      if (n) { F_addEdge(n, eCenter, "arterial"); n.trafficLightControlled = true; }
+    });
+  }
+
+  // 4 corner intersections (connect perpendicular ring road ends)
+  const corners = [
+    { x: -P_RING_W / 2, y: -P_RING_W / 2, h: northRing, v: westRing, hEnd: "start", vEnd: "start" },
+    { x: P_WORLD_PX + P_RING_W / 2, y: -P_RING_W / 2, h: northRing, v: eastRing, hEnd: "end", vEnd: "start" },
+    { x: -P_RING_W / 2, y: P_WORLD_PX + P_RING_W / 2, h: southRing, v: westRing, hEnd: "start", vEnd: "end" },
+    { x: P_WORLD_PX + P_RING_W / 2, y: P_WORLD_PX + P_RING_W / 2, h: southRing, v: eastRing, hEnd: "end", vEnd: "end" }
+  ];
+  corners.forEach(({ x, y, h, v, hEnd, vEnd }) => {
+    const center = F_addNode(x, y, { nodeType: "intersection" });
+    const hIdx = hEnd === "start" ? 0 : h.wbNodes.length - 1;
+    const vIdx = vEnd === "start" ? 0 : v.sbNodes.length - 1;
+    [h.wbNodes[hIdx], h.ebNodes[hIdx], v.sbNodes[vIdx], v.nbNodes[vIdx]].forEach(n => {
+      if (n) { F_addEdge(n, center, "arterial"); n.trafficLightControlled = true; }
+    });
+  });
+
+  /* ── Step 5a: Mark ring road entry/exit points ──
+     Corner intersections and mid-side ring nodes serve as grid entry/exit. */
+  N_nodes.forEach(n => {
+    if (n.nodeType !== "intersection") return;
+    // Corner and edge intersections on the ring road
+    if (n.x < 0 || n.x > P_WORLD_PX || n.y < 0 || n.y > P_WORLD_PX) {
+      n.isExit = true;
+    }
+  });
+
+  /* ── Step 6: Build adjacency list and edge lookup table ──
+     Directed edges (arterial lanes) only allow a→b traversal.
+     Undirected edges (internal, border connections) allow both directions. */
+  const N_adjacency = N_nodes.map(() => []);
+  const N_edgeLookup = {};
+  N_edges.forEach(e => {
+    N_adjacency[e.a.id].push({ node: e.b, edge: e });
+    if (!e.directed) {
+      N_adjacency[e.b.id].push({ node: e.a, edge: e });
+    }
+    N_edgeLookup[`${e.a.id}-${e.b.id}`] = e;
+    if (!e.directed) {
+      N_edgeLookup[`${e.b.id}-${e.a.id}`] = e;
+    }
+  });
+
+  return { N_nodes, N_edges, N_adjacency, N_edgeLookup, N_nodeMap, N_districtNodes };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   F_dijkstra(N_nodes, N_adjacency, N_edgeLookup, startId, endId, arterialOnly)
+
+   Finds the shortest path between two nodes using Dijkstra's algorithm (1956).
+   Edge weights = physical_length × congestion_factor, where:
+     congestion_factor = 1 + (V_currentCars / capacity) × 4
+
+   PARAMETERS:
+   - arterialOnly: if true, restricts traversal to arterial edges only
+     (used for baseline through-traffic that stays on main roads)
+
+   RETURNS: Array of node IDs forming the path, or null if no path exists.
+   ═══════════════════════════════════════════════════════════════════════════════ */
+function F_dijkstra(N_nodes, N_adjacency, N_edgeLookup, startId, endId, arterialOnly = false) {
+  if (startId === endId) return [startId];
+
+  const V_dist = new Float64Array(N_nodes.length).fill(Infinity);
+  const V_prev = new Int32Array(N_nodes.length).fill(-1);
+  V_dist[startId] = 0;
+
+  // Simple priority queue (array-sorted; adequate for our graph size ~500 nodes)
+  const V_queue = [{ id: startId, d: 0 }];
+  const V_visited = new Set();
+
+  while (V_queue.length) {
+    V_queue.sort((a, b) => a.d - b.d);
+    const { id: currentId } = V_queue.shift();
+    if (V_visited.has(currentId)) continue;
+    V_visited.add(currentId);
+
+    // Found target — reconstruct path
+    if (currentId === endId) {
+      const path = [endId];
+      let traceId = endId;
+      while (V_prev[traceId] !== -1 && traceId !== startId) {
+        traceId = V_prev[traceId];
+        path.unshift(traceId);
+      }
+      if (path[0] !== startId) path.unshift(startId);
+      return path;
+    }
+
+    // Explore neighbors
+    for (const { node: neighbor, edge } of N_adjacency[currentId]) {
+      if (V_visited.has(neighbor.id)) continue;
+      if (arterialOnly && edge.type !== "arterial") continue;
+
+      // Congestion-weighted edge cost
+      const congestionFactor = 1 + (edge.V_currentCars / edge.capacity) * 4;
+      const edgeCost = edge.length * congestionFactor;
+      const newDist = V_dist[currentId] + edgeCost;
+
+      if (newDist < V_dist[neighbor.id]) {
+        V_dist[neighbor.id] = newDist;
+        V_prev[neighbor.id] = currentId;
+        V_queue.push({ id: neighbor.id, d: newDist });
+      }
+    }
+  }
+  return null; // No path found
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   MAIN REACT COMPONENT
+   ═══════════════════════════════════════════════════════════════════════════════ */
+function ABMTrafficSimulator() {
+  const V_canvasRef = useRef(null);
+  const V_simRef = useRef(null);      // Holds all simulation state between renders
+  const V_animFrameRef = useRef(null); // requestAnimationFrame handle
+  const V_chartRef = useRef(null);     // Chart container ref for pixel-based sizing
+  const [V_chartWidth, setV_chartWidth] = useState(600); // Actual pixel width of chart
+
+  /* ── P_ Parameters (user-controlled via UI) ── */
+  const [P_householdsPerDist, setP_householdsPerDist] = useState(30);
+  const [P_pctSchoolAge, setP_pctSchoolAge] = useState(50);
+  const [P_assignMode, setP_assignMode] = useState("nearest");
+  const [P_outOfDistPref, setP_outOfDistPref] = useState(10);
+  const [P_baselineCarsPerMin, setP_baselineCarsPerMin] = useState(1);
+  const [P_baselineFlowMode, setP_baselineFlowMode] = useState("uniform");
+  const [P_tlCycleMin, setP_tlCycleMin] = useState(5);
+  const [P_pctGoWork, setP_pctGoWork] = useState(40);
+  const [P_simSpeed, setP_simSpeed] = useState(1);
+  const [P_allRedLights, setP_allRedLights] = useState(false);
+  const [P_randomSchoolLocs, setP_randomSchoolLocs] = useState(false);
+  const [P_useFixedSeed, setP_useFixedSeed] = useState(false);
+  const [P_seedValue, setP_seedValue] = useState(42);
+  const [V_showRoadLabels, setV_showRoadLabels] = useState(false);
+
+  /* ── V_ Internal state ── */
+  const [V_running, setV_running] = useState(false);
+  const [V_tick, setV_tick] = useState(0);
+  const [V_stats, setV_stats] = useState(null);
+  const [V_savedScenario, setV_savedScenario] = useState(null);
+  const [V_showComparison, setV_showComparison] = useState(false);
+  const [V_selectedDistrict, setV_selectedDistrict] = useState(null);
+  const [V_histBaseline, setV_histBaseline] = useState([]);   // Per-tick baseline cars on arterials
+  const [V_histCrossDistrict, setV_histCrossDistrict] = useState([]); // Per-tick cross-district cars on arterials
+
+  /* ── School configuration: { districtId: Set<schoolType> } ── */
+  const [P_schools, setP_schools] = useState(() => {
+    const s = {};
+    for (let i = 0; i < 9; i++) s[i] = new Set(C_SCHOOL_TYPES);
+    return s;
+  });
+
+  /** F_toggleSchool: Add or remove a school type from a district */
+  const F_toggleSchool = (districtId, schoolType) => {
+    setP_schools(prev => {
+      const next = { ...prev };
+      const schoolSet = new Set(next[districtId]);
+      if (schoolSet.has(schoolType)) schoolSet.delete(schoolType);
+      else schoolSet.add(schoolType);
+      next[districtId] = schoolSet;
+      return next;
+    });
+  };
+
+  /* ═══════════════════════════════════════════════════════════════════════════
+     F_initSim()
+     Master initialization. Builds world, generates households, computes routes.
+     Called on RESET or when parameters change.
+     
+     SEQUENCE:
+     1. Build road network (F_buildNetwork)
+     2. Filter household-placeable nodes per district
+     3. Generate C_Household agents with random school-age children
+     4. For each household: determine school destinations per child
+     5. Optimize multi-stop order (brute-force TSP for ≤3 stops)
+     6. Compute departure time using truncated normal distribution
+     7. Build full route: home → schools → (work exit | home return)
+     8. Generate baseline through-traffic cars (arterial-only routes)
+     ═══════════════════════════════════════════════════════════════════════════ */
+  const F_initSim = useCallback(() => {
+    /* Seed PRNG: fixed seed for reproducibility, or fresh seed each run */
+    V_rng.seed(P_useFixedSeed ? P_seedValue : Date.now());
+
+    const net = F_buildNetwork();
+    const V_tlCycleTicks = Math.round(P_tlCycleMin * 60 / P_TICK_SECONDS);
+
+    /* ── Step 2: Identify interior nodes per district for household placement ──
+       Excludes border nodes (which sit on arterials). Households are placed
+       along internal streets, simulating real parcel/lot positions. */
+    const V_householdNodes = {};
+    for (let distId = 0; distId < 9; distId++) {
+      V_householdNodes[distId] = net.N_districtNodes[distId].filter(node => {
+        const distRow = Math.floor(distId / P_GRID_SIZE);
+        const distCol = distId % P_GRID_SIZE;
+        const originX = distCol * (P_DIST_PX + P_ARTERIAL_W);
+        const originY = distRow * (P_DIST_PX + P_ARTERIAL_W);
+        const localX = node.x - originX;
+        const localY = node.y - originY;
+        // Must be interior (not on district boundary)
+        return localX > 1 && localX < P_DIST_PX - 1 && localY > 1 && localY < P_DIST_PX - 1;
+      });
+    }
+
+    /* ── Step 3: Generate C_Household agents ── */
+    const V_households = [];
+    for (let distId = 0; distId < 9; distId++) {
+      const availableNodes = V_householdNodes[distId];
+      if (!availableNodes.length) continue;
+
+      for (let h = 0; h < P_householdsPerDist; h++) {
+        // Place household at a street intersection node (cycles through available nodes)
+        const homeNode = availableNodes[h % availableNodes.length];
+
+        // Randomly assign school-age children
+        const children = []; // Array of school type strings, e.g. ["EB", "MG", "SB"]
+        if (V_rng.next() * 100 < P_pctSchoolAge) {
+          const numChildren = F_randInt(1, 3);
+          for (let c = 0; c < numChildren; c++) {
+            children.push(F_pickRandom(C_SCHOOL_TYPES));
+          }
+        }
+
+        V_households.push({
+          id: V_households.length,
+          districtId: distId,
+          homeNodeId: homeNode.id,
+          children
+        });
+      }
+    }
+
+    /* ── Determine school node locations within each district ── */
+    const V_schoolNodeMap = {};  // { districtId: { schoolType: node } }
+    for (let distId = 0; distId < 9; distId++) {
+      V_schoolNodeMap[distId] = {};
+      const availableNodes = V_householdNodes[distId];
+      C_SCHOOL_TYPES.forEach(schoolType => {
+        V_schoolNodeMap[distId][schoolType] = availableNodes.length > 0
+          ? (P_randomSchoolLocs ? F_pickRandom(availableNodes) : availableNodes[Math.floor(availableNodes.length / 2)])
+          : net.N_nodes[0];
+      });
+    }
+
+    /* ── Step 4-7: Build trips for each household ── */
+    const V_cars = [];
+
+    V_households.forEach(household => {
+      if (!household.children.length) return;
+
+      /* Step 4: Determine school destination for each child */
+      const stops = [];  // Array of { type, districtId, nodeId }
+
+      household.children.forEach(childType => {
+        const localSchoolExists = P_schools[household.districtId]?.has(childType);
+        const prefersOutOfDist = localSchoolExists && V_rng.next() * 100 < P_outOfDistPref;
+        let targetDistrict = -1;
+
+        if (localSchoolExists && !prefersOutOfDist) {
+          // Use local school
+          targetDistrict = household.districtId;
+        } else {
+          // Find districts that have this school type
+          const candidates = [];
+          for (let d = 0; d < 9; d++) {
+            if (d !== household.districtId && P_schools[d]?.has(childType)) candidates.push(d);
+          }
+
+          if (!candidates.length) {
+            // No school available elsewhere; use local if exists, else skip
+            if (localSchoolExists) targetDistrict = household.districtId;
+            else return;
+          } else if (P_assignMode === "nearest") {
+            // Find nearest district by grid distance
+            const homeRow = Math.floor(household.districtId / P_GRID_SIZE);
+            const homeCol = household.districtId % P_GRID_SIZE;
+            let bestDist = candidates[0], bestGridDist = 99;
+            candidates.forEach(d => {
+              const gridDist = Math.abs(Math.floor(d / P_GRID_SIZE) - homeRow)
+                             + Math.abs(d % P_GRID_SIZE - homeCol);
+              if (gridDist < bestGridDist) { bestGridDist = gridDist; bestDist = d; }
+            });
+            targetDistrict = bestDist;
+          } else {
+            // Random equal probability
+            targetDistrict = F_pickRandom(candidates);
+          }
+        }
+
+        if (targetDistrict >= 0) {
+          const schoolNode = V_schoolNodeMap[targetDistrict]?.[childType] || net.N_nodes[0];
+          stops.push({ type: childType, districtId: targetDistrict, nodeId: schoolNode.id });
+        }
+      });
+
+      if (!stops.length) return;
+
+      /* Step 5: Multi-stop TSP optimization (brute-force for ≤3 stops) */
+      if (stops.length > 1) {
+        const F_permutations = (arr) => {
+          if (arr.length <= 1) return [arr];
+          const result = [];
+          arr.forEach((item, i) => {
+            F_permutations([...arr.slice(0, i), ...arr.slice(i + 1)])
+              .forEach(perm => result.push([item, ...perm]));
+          });
+          return result;
+        };
+        const homeNode = net.N_nodes[household.homeNodeId];
+        let bestPerm = stops, bestDist = Infinity;
+        F_permutations([...stops]).forEach(perm => {
+          let totalDist = 0, prevNode = homeNode;
+          perm.forEach(stop => {
+            totalDist += F_manhattanDist(prevNode, net.N_nodes[stop.nodeId]);
+            prevNode = net.N_nodes[stop.nodeId];
+          });
+          if (totalDist < bestDist) { bestDist = totalDist; bestPerm = perm; }
+        });
+        stops.length = 0;
+        bestPerm.forEach(s => stops.push(s));
+      }
+
+      /* Step 6: Compute departure time using truncated normal distribution
+         
+         The departure is back-calculated from the EARLIEST school start time
+         among the household's children, minus an estimated trip duration buffer.
+         
+         - More children → earlier departure (extra 2 min per child beyond 1)
+         - Standard deviation = 8 ticks (~2 min) → most depart within ±4 min
+         - Clamped to [20, 380] ticks (5:35 AM to 7:05 AM)
+      */
+      const earliestSchoolStage = household.children.reduce((earliest, childType) => {
+        const stage = childType[0]; // 'E', 'M', or 'S'
+        const startTick = P_SCHOOL_START_TICKS[stage] || 300;
+        return Math.min(earliest, startTick);
+      }, 600);
+
+      // Estimate trip duration: ~60 ticks (~15 min) for cross-district, ~20 ticks (~5 min) local
+      const hasCrossDistTrip = stops.some(s => s.districtId !== household.districtId);
+      const V_estimatedTripTicks = hasCrossDistTrip ? 60 : 20;
+      const V_childrenBonus = (household.children.length - 1) * 8; // 2 min earlier per extra child
+      const V_bufferTicks = 20; // 5 min buffer before school starts
+
+      const V_meanDeparture = earliestSchoolStage - V_estimatedTripTicks - V_bufferTicks - V_childrenBonus;
+      const V_stdDev = 8; // ~2 minutes standard deviation
+      const V_departureTick = F_normalRandom(V_meanDeparture, V_stdDev, 20, 380);
+
+      /* Step 7: Build full chained route */
+      let V_fullRoute = [];
+      let V_currentNodeId = household.homeNodeId;
+      let V_touchesArterial = false;
+
+      const F_checkArterial = (path) => {
+        for (let i = 0; i < path.length - 1; i++) {
+          if (net.N_edgeLookup[`${path[i]}-${path[i + 1]}`]?.type === "arterial") {
+            V_touchesArterial = true;
+          }
+        }
+      };
+
+      // Route through all school stops
+      stops.forEach(stop => {
+        const path = F_dijkstra(net.N_nodes, net.N_adjacency, net.N_edgeLookup, V_currentNodeId, stop.nodeId);
+        if (path) {
+          if (V_fullRoute.length) path.shift(); // Remove duplicate node at junction
+          V_fullRoute = V_fullRoute.concat(path);
+          F_checkArterial(path);
+          V_currentNodeId = stop.nodeId;
+        }
+      });
+
+      // Post-drop: drive to work (RANDOM exit) or return home
+      const V_goesToWork = V_rng.next() * 100 < P_pctGoWork;
+      if (V_goesToWork) {
+        /* FIX 2.2.3: Work destination is a RANDOM grid exit, not nearest.
+           This prevents all commuters from converging to the same exit point. */
+        const exitNodes = net.N_nodes.filter(n => n.isExit);
+        if (exitNodes.length) {
+          const randomExit = F_pickRandom(exitNodes);
+          const pathToExit = F_dijkstra(net.N_nodes, net.N_adjacency, net.N_edgeLookup, V_currentNodeId, randomExit.id);
+          if (pathToExit) {
+            pathToExit.shift();
+            V_fullRoute = V_fullRoute.concat(pathToExit);
+            F_checkArterial(pathToExit);
+          }
+        }
+      } else {
+        const pathHome = F_dijkstra(net.N_nodes, net.N_adjacency, net.N_edgeLookup, V_currentNodeId, household.homeNodeId);
+        if (pathHome) {
+          pathHome.shift();
+          V_fullRoute = V_fullRoute.concat(pathHome);
+          F_checkArterial(pathHome);
+        }
+      }
+
+      // Create car agent if route is valid
+      if (V_fullRoute.length >= 2) {
+        V_cars.push({
+          id: V_cars.length,
+          route: V_fullRoute,           // Array of node IDs
+          routeIndex: 0,                // Current segment index
+          segmentProgress: 0,           // 0.0–1.0 progress along current segment
+          touchesArterial: V_touchesArterial,  // Ever uses an arterial? (determines color)
+          onArterial: false,            // Currently on arterial segment?
+          done: false,                  // Trip complete?
+          departureTick: V_departureTick,
+          x: net.N_nodes[V_fullRoute[0]].x,    // Current pixel position
+          y: net.N_nodes[V_fullRoute[0]].y,
+          tripType: "household",
+          totalTicks: 0                 // Time elapsed since departure
+        });
+      }
+    });
+
+    /* ── Step 8: Generate baseline through-traffic (blue cars) ──
+       Cars/min rate × 150-minute window = total cars.
+       Departure timing depends on P_baselineFlowMode:
+         fixed:            evenly spaced (no randomness)
+         uniform:          random uniform across [0, 500]
+         lognormal:        right-skewed (heavy early, long tail)
+         reverse_lognormal: left-skewed (light early, heavy late)
+       FIX 2.3: Filter exit nodes to ONLY those with arterial edges.
+       Previously, most exit nodes were internal-street-only, causing
+       arterialOnly routing to fail silently and discard ~80% of cars. */
+    const V_arterialExitNodes = net.N_nodes.filter(n => {
+      if (!n.isExit) return false;
+      // Must have at least one arterial edge
+      return net.N_adjacency[n.id].some(({ edge }) => edge.type === "arterial");
+    });
+    const V_simDurationMin = P_TOTAL_TICKS * P_TICK_SECONDS / 60; // 150 minutes
+    const V_totalBaselineCars = Math.round(P_baselineCarsPerMin * V_simDurationMin);
+    const V_maxDepartureTick = 500; // Don't spawn after ~7:35 AM
+
+    for (let b = 0; b < V_totalBaselineCars; b++) {
+      if (V_arterialExitNodes.length < 2) break;
+
+      // Pick random origin and destination exits (must be different)
+      const origin = F_pickRandom(V_arterialExitNodes);
+      let destination = F_pickRandom(V_arterialExitNodes);
+      let attempts = 0;
+      while (destination.id === origin.id && attempts < 20) {
+        destination = F_pickRandom(V_arterialExitNodes);
+        attempts++;
+      }
+
+      // Compute departure tick based on flow mode
+      let departureTick;
+      switch (P_baselineFlowMode) {
+        case "fixed":
+          departureTick = Math.round((b / Math.max(V_totalBaselineCars - 1, 1)) * V_maxDepartureTick);
+          break;
+        case "lognormal":
+          departureTick = F_logNormalTick(V_maxDepartureTick);
+          break;
+        case "reverse_lognormal":
+          departureTick = V_maxDepartureTick - F_logNormalTick(V_maxDepartureTick);
+          break;
+        default: // "uniform"
+          departureTick = F_randInt(0, V_maxDepartureTick);
+          break;
+      }
+
+      // Route using arterial-only edges
+      const path = F_dijkstra(net.N_nodes, net.N_adjacency, net.N_edgeLookup, origin.id, destination.id, true);
+      if (path && path.length >= 3) {
+        V_cars.push({
+          id: V_cars.length,
+          route: path,
+          routeIndex: 0,
+          segmentProgress: 0,
+          touchesArterial: true,
+          onArterial: true,
+          done: false,
+          departureTick,
+          x: net.N_nodes[path[0]].x,
+          y: net.N_nodes[path[0]].y,
+          tripType: "baseline",
+          totalTicks: 0
+        });
+      }
+    }
+
+    /* ── Store simulation state ── */
+    V_simRef.current = {
+      net,
+      V_cars,
+      V_households,
+      V_tick: 0,
+      V_tlCycleTicks,
+      P_allRedLights,
+      V_histBaseline: new Array(P_TOTAL_TICKS).fill(0),
+      V_histCrossDistrict: new Array(P_TOTAL_TICKS).fill(0),
+      S_peakArterial: 0,
+      V_schoolNodeMap
+    };
+
+    setV_tick(0);
+    setV_stats(null);
+    setV_histBaseline([]);
+    setV_histCrossDistrict([]);
+  }, [P_householdsPerDist, P_pctSchoolAge, P_assignMode, P_outOfDistPref, P_baselineCarsPerMin, P_baselineFlowMode,
+      P_pctGoWork, P_schools, P_tlCycleMin, P_allRedLights, P_randomSchoolLocs, P_useFixedSeed, P_seedValue]);
+
+  /* ═══════════════════════════════════════════════════════════════════════════
+     F_stepSim()
+     Advances the simulation by exactly 1 tick (= 15 real seconds).
+     
+     SEQUENCE PER TICK:
+     1. Reset edge car counts to 0
+     2. Count how many cars occupy each edge (for congestion calculation)
+     3. For each active car:
+        a. Check traffic light at intersection → wait if red
+        b. Check edge capacity → wait if over 120% capacity (queue blocking)
+        c. Calculate speed: free_flow × max(0.28, 1 - occupancy × 0.72)
+        d. Advance car along its route segment
+        e. If segment complete → move to next segment
+        f. If route complete → mark car as done
+     4. Record per-tick history for chart
+     5. Calculate all output statistics
+     
+     RETURNS: true if simulation should continue, false if finished
+     ═══════════════════════════════════════════════════════════════════════════ */
+  const F_stepSim = useCallback(() => {
+    const sim = V_simRef.current;
+    if (!sim || sim.V_tick >= P_TOTAL_TICKS) return false;
+    sim.V_tick++;
+
+    /* Step 1: Reset edge car counts */
+    sim.net.N_edges.forEach(e => e.V_currentCars = 0);
+
+    /* Step 2: Count cars per edge for congestion */
+    sim.V_cars.forEach(car => {
+      if (car.done || sim.V_tick < car.departureTick) return;
+      if (car.routeIndex < car.route.length - 1) {
+        const edgeKey = `${car.route[car.routeIndex]}-${car.route[car.routeIndex + 1]}`;
+        const edge = sim.net.N_edgeLookup[edgeKey];
+        if (edge) edge.V_currentCars++;
+      }
+    });
+
+    /* Step 3: Move each car */
+    let S_baselineOnArterial = 0;
+    let S_crossDistOnArterial = 0;
+
+    sim.V_cars.forEach(car => {
+      if (car.done || sim.V_tick < car.departureTick) return;
+      car.totalTicks++;
+
+      if (car.routeIndex >= car.route.length - 1) {
+        car.done = true;
+        return;
+      }
+
+      const fromNode = sim.net.N_nodes[car.route[car.routeIndex]];
+      const toNode = sim.net.N_nodes[car.route[car.routeIndex + 1]];
+      const edgeKey = `${car.route[car.routeIndex]}-${car.route[car.routeIndex + 1]}`;
+      const edge = sim.net.N_edgeLookup[edgeKey];
+
+      // Update arterial status
+      car.onArterial = edge?.type === "arterial";
+      if (car.onArterial) {
+        if (car.tripType === "baseline") S_baselineOnArterial++;
+        else if (car.touchesArterial) S_crossDistOnArterial++;
+      }
+
+      /* Step 3a: Traffic light check at intersections
+         FIX 2.3: Also applies to arterial_lane nodes tagged as trafficLightControlled,
+         so baseline cars going straight through an intersection must stop at red too. */
+      const isTrafficLightNode = fromNode.nodeType === "intersection" || fromNode.trafficLightControlled;
+      if (car.segmentProgress < 0.1 && isTrafficLightNode) {
+        if (sim.P_allRedLights) return; // All-red mode: nobody passes
+        const phase = Math.floor(sim.V_tick / sim.V_tlCycleTicks) % 2;
+        const movingHorizontally = Math.abs(toNode.x - fromNode.x) > Math.abs(toNode.y - fromNode.y);
+        const greenForThisDirection = movingHorizontally ? phase === 0 : phase === 1;
+        if (!greenForThisDirection) return; // Wait at red light
+      }
+
+      /* Step 3b: Queue blocking — don't advance if segment way over capacity */
+      if (edge && edge.V_currentCars > edge.capacity * 1.2) return;
+
+      /* Step 3c: Calculate speed from congestion (Greenshields model) */
+      const occupancy = edge ? edge.V_currentCars / edge.capacity : 0;
+      const speedFactor = Math.max(P_MIN_SPEED_FACTOR, 1 - occupancy * 0.72);
+      const segmentLength = edge ? edge.length : F_euclideanDist(fromNode, toNode);
+
+      /* Step 3d: Advance car position */
+      car.segmentProgress += (P_FREE_SPEED_PX * speedFactor) / Math.max(segmentLength, 1);
+
+      /* Step 3e-f: Check segment/route completion */
+      if (car.segmentProgress >= 1) {
+        car.routeIndex++;
+        car.segmentProgress = 0;
+        if (car.routeIndex >= car.route.length - 1) car.done = true;
+      }
+
+      // Interpolate visual position
+      const t = Math.min(car.segmentProgress, 1);
+      car.x = fromNode.x + (toNode.x - fromNode.x) * t;
+      car.y = fromNode.y + (toNode.y - fromNode.y) * t;
+    });
+
+    /* ── Step 3.5: Visual queue positioning ──
+       FIX 2.3: Prevents overlapping dots and creates orderly single-file queues.
+       Pass 1: Cars stopped at traffic lights queue behind the stop line
+               along their approach direction, evenly spaced.
+       Pass 2: Cars sharing any other edge are spaced evenly along it. */
+
+    const V_carSpacingPx = 3.5;         // Pixels between car centers in queue (~50m real)
+    const V_queuedCarIds = new Set();   // Track cars handled by TL queue
+
+    // ── Pass 1: Traffic light queuing ──
+    const V_tlQueues = {};  // key: "nodeId-dirX-dirY" → { node, dx, dy, cars[] }
+    sim.V_cars.forEach(car => {
+      if (car.done || sim.V_tick < car.departureTick) return;
+      if (car.routeIndex >= car.route.length - 1) return;
+      const fn = sim.net.N_nodes[car.route[car.routeIndex]];
+      const isStopped = car.segmentProgress < 0.15;
+      const isAtTL = fn.nodeType === "intersection" || fn.trafficLightControlled;
+      if (!isStopped || !isAtTL) return;
+
+      // Compute normalized approach direction (unit vector from previous node)
+      let dx = 0, dy = 0;
+      if (car.routeIndex > 0) {
+        const pn = sim.net.N_nodes[car.route[car.routeIndex - 1]];
+        const d = F_euclideanDist(pn, fn);
+        if (d > 0) { dx = (fn.x - pn.x) / d; dy = (fn.y - pn.y) / d; }
+      } else {
+        const tn = sim.net.N_nodes[car.route[car.routeIndex + 1]];
+        const d = F_euclideanDist(fn, tn);
+        if (d > 0) { dx = (tn.x - fn.x) / d; dy = (tn.y - fn.y) / d; }
+      }
+
+      // Group by node + approach direction (round to avoid float key issues)
+      const key = `${fn.id}-${Math.round(dx * 10)}-${Math.round(dy * 10)}`;
+      if (!V_tlQueues[key]) V_tlQueues[key] = { node: fn, dx, dy, cars: [] };
+      V_tlQueues[key].cars.push(car);
+    });
+
+    // Position each TL queue: lead car at district edge, rest trail behind
+    Object.values(V_tlQueues).forEach(({ node, dx, dy, cars }) => {
+      cars.sort((a, b) => b.totalTicks - a.totalTicks);
+      const leadCar = cars[0];
+
+      let anchorX = node.x, anchorY = node.y;
+
+      if (node.trafficLightControlled) {
+        // Lane node at intersection: find the connected district border node
+        // that's aligned with where the car came from (backward direction).
+        const borderNodes = sim.net.N_adjacency[node.id]
+          .filter(({ edge: e, node: n }) => e.type === "arterial" && n.nodeType === "internal")
+          .map(({ node: n }) => n);
+
+        let bestBorder = null, bestScore = 0.3; // cosine threshold
+        borderNodes.forEach(bn => {
+          const bx = bn.x - node.x, by = bn.y - node.y;
+          const len = Math.sqrt(bx * bx + by * by);
+          if (len > 0) {
+            const score = (bx * (-dx) + by * (-dy)) / len; // alignment with backward dir
+            if (score > bestScore) { bestScore = score; bestBorder = bn; }
+          }
+        });
+
+        if (bestBorder) {
+          // Cross-arterial approach: anchor at district border
+          anchorX = bestBorder.x;
+          anchorY = bestBorder.y;
+        }
+        // else: along-lane approach — TL node is at/near the district edge, keep anchor at node position
+      } else if (node.nodeType === "intersection") {
+        // Intersection center: offset toward incoming lane
+        const edgeOffset = P_ARTERIAL_W * 0.45;
+        anchorX = node.x - dx * edgeOffset;
+        anchorY = node.y - dy * edgeOffset;
+      }
+
+      cars.forEach((car, i) => {
+        car.x = anchorX - dx * i * V_carSpacingPx;
+        car.y = anchorY - dy * i * V_carSpacingPx;
+        V_queuedCarIds.add(car.id);
+      });
+    });
+
+    // ── Pass 2: General edge deconfliction ──
+    const V_edgeCars = {};
+    sim.V_cars.forEach(car => {
+      if (car.done || sim.V_tick < car.departureTick) return;
+      if (car.routeIndex >= car.route.length - 1) return;
+      if (V_queuedCarIds.has(car.id)) return;  // Already positioned by TL queue
+      const ek = `${car.route[car.routeIndex]}-${car.route[car.routeIndex + 1]}`;
+      if (!V_edgeCars[ek]) V_edgeCars[ek] = [];
+      V_edgeCars[ek].push(car);
+    });
+
+    Object.entries(V_edgeCars).forEach(([ek, cars]) => {
+      if (cars.length <= 1) return;
+      const edge = sim.net.N_edgeLookup[ek];
+      if (!edge) return;
+      // Sort: highest progress first (lead car closest to destination)
+      cars.sort((a, b) => b.segmentProgress - a.segmentProgress);
+      const fn = sim.net.N_nodes[cars[0].route[cars[0].routeIndex]];
+      const tn = sim.net.N_nodes[cars[0].route[cars[0].routeIndex + 1]];
+      const spacingFrac = V_carSpacingPx / Math.max(edge.length, 1);
+      const leadProg = cars[0].segmentProgress;
+      cars.forEach((car, i) => {
+        const p = Math.max(0, Math.min(1, leadProg - i * spacingFrac));
+        car.x = fn.x + (tn.x - fn.x) * p;
+        car.y = fn.y + (tn.y - fn.y) * p;
+      });
+    });
+
+    /* Step 4: Record history for chart */
+    const tickIndex = Math.min(sim.V_tick, P_TOTAL_TICKS - 1);
+    sim.V_histBaseline[tickIndex] = S_baselineOnArterial;
+    sim.V_histCrossDistrict[tickIndex] = S_crossDistOnArterial;
+    sim.S_peakArterial = Math.max(sim.S_peakArterial, S_baselineOnArterial + S_crossDistOnArterial);
+
+    /* Step 5: Calculate output statistics */
+    const F_ticksToMinutes = (ticks) => (ticks * P_TICK_SECONDS / 60).toFixed(1);
+    const completedCars = sim.V_cars.filter(c => c.done);
+    const completedHousehold = completedCars.filter(c => c.tripType === "household");
+    const completedArterial = completedHousehold.filter(c => c.touchesArterial);
+    const completedLocal = completedHousehold.filter(c => !c.touchesArterial);
+    const completedBaseline = completedCars.filter(c => c.tripType === "baseline");
+
+    const F_avgTime = (carArray) => carArray.length
+      ? F_ticksToMinutes(carArray.reduce((sum, c) => sum + c.totalTicks, 0) / carArray.length)
+      : "—";
+
+    sim.V_stats = {
+      S_arterialNow: S_baselineOnArterial + S_crossDistOnArterial,
+      S_baselineNow: S_baselineOnArterial,
+      S_crossDistNow: S_crossDistOnArterial,
+      S_peakArterial: sim.S_peakArterial,
+      S_avgTripAll: F_avgTime(completedCars),
+      S_avgTripArterial: F_avgTime(completedArterial),
+      S_avgTripLocal: F_avgTime(completedLocal),
+      S_avgTripBaseline: F_avgTime(completedBaseline),
+      S_completedTrips: completedCars.length,
+      S_totalTrips: sim.V_cars.length,
+      S_brightRedActive: sim.V_cars.filter(c => c.tripType === "household" && c.touchesArterial && c.onArterial && !c.done && sim.V_tick >= c.departureTick).length,
+      S_darkRedActive: sim.V_cars.filter(c => c.tripType === "household" && c.touchesArterial && !c.onArterial && !c.done && sim.V_tick >= c.departureTick).length,
+      S_blueActive: sim.V_cars.filter(c => c.tripType === "baseline" && !c.done && sim.V_tick >= c.departureTick).length,
+      S_grayActive: sim.V_cars.filter(c => c.tripType === "household" && !c.touchesArterial && !c.done && sim.V_tick >= c.departureTick).length,
+    };
+
+    return sim.V_tick < P_TOTAL_TICKS && !sim.V_cars.every(c => c.done);
+  }, []);
+
+  /* ═══════════════════════════════════════════════════════════════════════════
+     F_render()
+     Draws the current simulation state on the HTML canvas.
+     Called every animation frame (decoupled from sim stepping for slow speeds).
+     ═══════════════════════════════════════════════════════════════════════════ */
+  const F_render = useCallback(() => {
+    const canvas = V_canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const sim = V_simRef.current;
+    if (!sim) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.width / dpr;
+    const H = canvas.height / dpr;
+    const scale = Math.min((W - 16) / P_TOTAL_PX, (H - 8) / P_TOTAL_PX);
+    const offsetX = 8 + (W - 16 - P_TOTAL_PX * scale) / 2;
+    const offsetY = 4;
+    const tx = x => offsetX + (x + P_RING_W) * scale;
+    const ty = y => offsetY + (y + P_RING_W) * scale;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0, 0, W, H);
+
+    /* ── Draw ring road fill ── */
+    ctx.fillStyle = "#262320";
+    // North ring
+    ctx.fillRect(tx(-P_RING_W), ty(-P_RING_W), P_TOTAL_PX * scale, P_RING_W * scale);
+    // South ring
+    ctx.fillRect(tx(-P_RING_W), ty(P_WORLD_PX), P_TOTAL_PX * scale, P_RING_W * scale);
+    // West ring
+    ctx.fillRect(tx(-P_RING_W), ty(0), P_RING_W * scale, P_WORLD_PX * scale);
+    // East ring
+    ctx.fillRect(tx(P_WORLD_PX), ty(0), P_RING_W * scale, P_WORLD_PX * scale);
+
+    /* ── Draw ring road median barriers ── */
+    ctx.strokeStyle = "#b8860b";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    // North median
+    ctx.beginPath(); ctx.moveTo(tx(-P_RING_W), ty(-P_RING_W / 2)); ctx.lineTo(tx(P_WORLD_PX + P_RING_W), ty(-P_RING_W / 2)); ctx.stroke();
+    // South median
+    ctx.beginPath(); ctx.moveTo(tx(-P_RING_W), ty(P_WORLD_PX + P_RING_W / 2)); ctx.lineTo(tx(P_WORLD_PX + P_RING_W), ty(P_WORLD_PX + P_RING_W / 2)); ctx.stroke();
+    // West median
+    ctx.beginPath(); ctx.moveTo(tx(-P_RING_W / 2), ty(-P_RING_W)); ctx.lineTo(tx(-P_RING_W / 2), ty(P_WORLD_PX + P_RING_W)); ctx.stroke();
+    // East median
+    ctx.beginPath(); ctx.moveTo(tx(P_WORLD_PX + P_RING_W / 2), ty(-P_RING_W)); ctx.lineTo(tx(P_WORLD_PX + P_RING_W / 2), ty(P_WORLD_PX + P_RING_W)); ctx.stroke();
+    ctx.setLineDash([]);
+
+    /* ── Draw internal arterial roads ── */
+    ctx.fillStyle = "#262320";
+    for (let i = 0; i < P_GRID_SIZE - 1; i++) {
+      const vx = i * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX;
+      ctx.fillRect(tx(vx), ty(0), P_ARTERIAL_W * scale, P_WORLD_PX * scale);
+      const hy = i * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX;
+      ctx.fillRect(tx(0), ty(hy), P_WORLD_PX * scale, P_ARTERIAL_W * scale);
+    }
+
+    /* ── Draw internal median barriers (yellow dashed lines) ── */
+    ctx.strokeStyle = "#b8860b";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    for (let i = 0; i < P_GRID_SIZE - 1; i++) {
+      const vx = i * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+      ctx.beginPath(); ctx.moveTo(tx(vx), ty(0)); ctx.lineTo(tx(vx), ty(P_WORLD_PX)); ctx.stroke();
+      const hy = i * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+      ctx.beginPath(); ctx.moveTo(tx(0), ty(hy)); ctx.lineTo(tx(P_WORLD_PX), ty(hy)); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    /* ── Draw districts ── */
+    for (let dr = 0; dr < P_GRID_SIZE; dr++) {
+      for (let dc = 0; dc < P_GRID_SIZE; dc++) {
+        const did = dr * P_GRID_SIZE + dc;
+        const dox = dc * (P_DIST_PX + P_ARTERIAL_W);
+        const doy = dr * (P_DIST_PX + P_ARTERIAL_W);
+
+        // District fill
+        ctx.fillStyle = V_selectedDistrict === did ? "#1c1a17" : "#161412";
+        ctx.fillRect(tx(dox), ty(doy), P_DIST_PX * scale, P_DIST_PX * scale);
+
+        // Internal streets
+        ctx.strokeStyle = "#262320";
+        ctx.lineWidth = 0.4;
+        for (let s = 1; s < P_INT_BLOCKS; s++) {
+          ctx.beginPath(); ctx.moveTo(tx(dox), ty(doy + s * P_CELL_PX)); ctx.lineTo(tx(dox + P_DIST_PX), ty(doy + s * P_CELL_PX)); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(tx(dox + s * P_CELL_PX), ty(doy)); ctx.lineTo(tx(dox + s * P_CELL_PX), ty(doy + P_DIST_PX)); ctx.stroke();
+        }
+
+        // District label
+        ctx.fillStyle = V_selectedDistrict === did ? "#f59e0b" : "#4a4540";
+        ctx.font = `bold ${Math.max(12, 13 * scale)}px monospace`;
+        ctx.textAlign = "center";
+        ctx.fillText(`D${did + 1}`, tx(dox + P_DIST_PX / 2), ty(doy + 14));
+
+        // School badges
+        const distSchools = P_schools[did] || new Set();
+        [...distSchools].forEach((st, si) => {
+          ctx.fillStyle = C_SCHOOL_COLORS[st];
+          ctx.font = `bold ${Math.max(8, 9 * scale)}px monospace`;
+          ctx.textAlign = "left";
+          ctx.fillText("■" + st, tx(dox + 5 + (si % 3) * 44), ty(doy + 26 + Math.floor(si / 3) * 13));
+        });
+
+        // Scale indicator (District 1 only)
+        if (did === 0) {
+          ctx.fillStyle = "#3a3a3a";
+          ctx.font = `${Math.max(9, 10 * scale)}px monospace`;
+          ctx.textAlign = "center";
+          ctx.fillText("2 km", tx(dox + P_DIST_PX / 2), ty(doy + P_DIST_PX - 5));
+        }
+      }
+    }
+
+    /* ── Draw traffic lights at ALL intersection nodes (internal + ring road) ── */
+    sim.net.N_nodes.forEach(n => {
+      if (n.nodeType !== "intersection") return;
+      const phase = sim.P_allRedLights ? -1 : Math.floor((sim.V_tick || 0) / sim.V_tlCycleTicks) % 2;
+      ctx.fillStyle = "#151412";
+      ctx.fillRect(tx(n.x) - 4 * scale, ty(n.y) - 4 * scale, 8 * scale, 8 * scale);
+      ctx.fillStyle = phase === 0 ? "#22c55e" : "#ef4444";
+      ctx.beginPath(); ctx.arc(tx(n.x) - 1.5 * scale, ty(n.y), 1.4 * scale, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = phase === 1 ? "#22c55e" : "#ef4444";
+      ctx.beginPath(); ctx.arc(tx(n.x) + 1.5 * scale, ty(n.y), 1.4 * scale, 0, Math.PI * 2); ctx.fill();
+    });
+
+    /* ── Draw road segment labels (debug overlay) ── */
+    if (V_showRoadLabels) {
+      ctx.font = `bold ${Math.max(7, 8 * scale)}px monospace`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+
+      const distNames = ["D1","D2","D3","D4","D5","D6","D7","D8","D9"];
+
+      // Vertical arterial lane labels (rotated to align with road)
+      for (let ac = 0; ac < P_GRID_SIZE - 1; ac++) {
+        const artStartX = ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX;
+        const sbX = artStartX + P_ARTERIAL_W * 0.28;  // Southbound lane (left)
+        const nbX = artStartX + P_ARTERIAL_W * 0.72;  // Northbound lane (right)
+
+        for (let dr = 0; dr < P_GRID_SIZE; dr++) {
+          const midY = dr * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX / 2;
+          const leftDist = dr * P_GRID_SIZE + ac;       // District to the left
+          const rightDist = dr * P_GRID_SIZE + ac + 1;  // District to the right
+
+          // SB lane label (rotated vertical)
+          ctx.fillStyle = "rgba(245,158,11,0.85)";
+          ctx.save(); ctx.translate(tx(sbX), ty(midY)); ctx.rotate(-Math.PI / 2);
+          ctx.fillText(`${distNames[leftDist]}E·SB`, 0, 0); ctx.restore();
+
+          // NB lane label (rotated vertical)
+          ctx.fillStyle = "rgba(59,130,246,0.85)";
+          ctx.save(); ctx.translate(tx(nbX), ty(midY)); ctx.rotate(-Math.PI / 2);
+          ctx.fillText(`${distNames[rightDist]}W·NB`, 0, 0); ctx.restore();
+        }
+      }
+
+      // Horizontal arterial lane labels
+      for (let ar = 0; ar < P_GRID_SIZE - 1; ar++) {
+        const artStartY = ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX;
+        const wbY = artStartY + P_ARTERIAL_W * 0.28;  // Westbound lane (top)
+        const ebY = artStartY + P_ARTERIAL_W * 0.72;  // Eastbound lane (bottom)
+
+        for (let dc = 0; dc < P_GRID_SIZE; dc++) {
+          const midX = dc * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX / 2;
+          const topDist = ar * P_GRID_SIZE + dc;         // District above
+          const bottomDist = (ar + 1) * P_GRID_SIZE + dc; // District below
+
+          // WB lane label (next to top district's south side)
+          ctx.fillStyle = "rgba(245,158,11,0.85)";
+          ctx.fillText(`${distNames[topDist]}S·WB`, tx(midX), ty(wbY));
+
+          // EB lane label (next to bottom district's north side)
+          ctx.fillStyle = "rgba(59,130,246,0.85)";
+          ctx.fillText(`${distNames[bottomDist]}N·EB`, tx(midX), ty(ebY));
+        }
+      }
+
+      // Ring road labels
+      ctx.fillStyle = "rgba(34,197,94,0.85)";
+      const rcx = P_WORLD_PX / 2;  // Center x
+      const rcy = P_WORLD_PX / 2;  // Center y
+
+      // North ring
+      ctx.fillText("RN·WB", tx(rcx), ty(-P_RING_W * 0.72));
+      ctx.fillText("RN·EB", tx(rcx), ty(-P_RING_W * 0.28));
+      // South ring
+      ctx.fillText("RS·WB", tx(rcx), ty(P_WORLD_PX + P_RING_W * 0.28));
+      ctx.fillText("RS·EB", tx(rcx), ty(P_WORLD_PX + P_RING_W * 0.72));
+      // West ring
+      ctx.save(); ctx.translate(tx(-P_RING_W * 0.72), ty(rcy)); ctx.rotate(-Math.PI / 2);
+      ctx.fillText("RW·SB", 0, 0); ctx.restore();
+      ctx.save(); ctx.translate(tx(-P_RING_W * 0.28), ty(rcy)); ctx.rotate(-Math.PI / 2);
+      ctx.fillText("RW·NB", 0, 0); ctx.restore();
+      // East ring
+      ctx.save(); ctx.translate(tx(P_WORLD_PX + P_RING_W * 0.28), ty(rcy)); ctx.rotate(-Math.PI / 2);
+      ctx.fillText("RE·SB", 0, 0); ctx.restore();
+      ctx.save(); ctx.translate(tx(P_WORLD_PX + P_RING_W * 0.72), ty(rcy)); ctx.rotate(-Math.PI / 2);
+      ctx.fillText("RE·NB", 0, 0); ctx.restore();
+
+      // Intersection labels
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.font = `${Math.max(6, 7 * scale)}px monospace`;
+      // Internal intersections
+      for (let ar = 0; ar < P_GRID_SIZE - 1; ar++) {
+        for (let ac = 0; ac < P_GRID_SIZE - 1; ac++) {
+          const ix = ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+          const iy = ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+          ctx.fillText(`TL${ar * (P_GRID_SIZE - 1) + ac + 1}`, tx(ix), ty(iy) - 6 * scale);
+        }
+      }
+
+      // Ring road intersections
+      const rh = P_RING_W / 2;
+      // North edge (vertical arterials meet north ring)
+      for (let ac = 0; ac < P_GRID_SIZE - 1; ac++) {
+        const cx = ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+        ctx.fillText(`TL-N${ac + 1}`, tx(cx), ty(-rh) - 6 * scale);
+      }
+      // South edge
+      for (let ac = 0; ac < P_GRID_SIZE - 1; ac++) {
+        const cx = ac * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+        ctx.fillText(`TL-S${ac + 1}`, tx(cx), ty(P_WORLD_PX + rh) - 6 * scale);
+      }
+      // West edge (horizontal arterials meet west ring)
+      for (let ar = 0; ar < P_GRID_SIZE - 1; ar++) {
+        const cy = ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+        ctx.fillText(`TL-W${ar + 1}`, tx(-rh), ty(cy) - 6 * scale);
+      }
+      // East edge
+      for (let ar = 0; ar < P_GRID_SIZE - 1; ar++) {
+        const cy = ar * (P_DIST_PX + P_ARTERIAL_W) + P_DIST_PX + P_ARTERIAL_W / 2;
+        ctx.fillText(`TL-E${ar + 1}`, tx(P_WORLD_PX + rh), ty(cy) - 6 * scale);
+      }
+      // Corners
+      ctx.fillText("TL-NW", tx(-rh), ty(-rh) - 6 * scale);
+      ctx.fillText("TL-NE", tx(P_WORLD_PX + rh), ty(-rh) - 6 * scale);
+      ctx.fillText("TL-SW", tx(-rh), ty(P_WORLD_PX + rh) - 6 * scale);
+      ctx.fillText("TL-SE", tx(P_WORLD_PX + rh), ty(P_WORLD_PX + rh) - 6 * scale);
+    }
+
+    /* ── Draw household dots ── */
+    sim.V_households?.forEach(hh => {
+      const node = sim.net.N_nodes[hh.homeNodeId];
+      if (!node) return;
+      ctx.fillStyle = hh.children.length ? "#3a3735" : "#222";
+      ctx.beginPath();
+      ctx.arc(tx(node.x), ty(node.y), Math.max(0.7, 1 * scale), 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    /* ── Draw car dots (uniform size, color-coded) ── */
+    const carRadius = Math.max(1.2, P_CAR_RADIUS_PX * scale);
+    sim.V_cars.forEach(car => {
+      if (car.done || sim.V_tick < car.departureTick) return;
+      let color;
+      if (car.tripType === "baseline") color = "#3b82f6";        // Blue
+      else if (car.touchesArterial) color = car.onArterial ? "#ef4444" : "#991b1b"; // Bright/Dark red
+      else color = "#9ca3af";                                     // Gray
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(tx(car.x), ty(car.y), carRadius, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    /* ── Draw legend ── */
+    const legendY = P_TOTAL_PX * scale + offsetY + 1;
+    [["#ef4444", "Bright Red"], ["#991b1b", "Dark Red"], ["#3b82f6", "Blue"], ["#9ca3af", "Gray"]].forEach(([c, l], i) => {
+      const lx = offsetX + i * (W - 16) / 4;
+      ctx.fillStyle = c;
+      ctx.beginPath(); ctx.arc(lx + 4, legendY + 6, 3.5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#888";
+      ctx.font = "10px monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(l, lx + 11, legendY + 10);
+    });
+  }, [P_schools, V_selectedDistrict, V_showRoadLabels]);
+
+  /* ── Canvas initialization + resize handling (FIX 2.3: dynamic resize) ── */
+  useEffect(() => {
+    const canvas = V_canvasRef.current;
+    if (!canvas) return;
+
+    const F_resizeCanvas = () => {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = canvas.offsetWidth * dpr;
+      canvas.height = canvas.offsetHeight * dpr;
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(1, 0, 0, 1, 0, 0); // Reset transform before scaling
+      ctx.scale(dpr, dpr);
+      F_render();
+    };
+
+    F_resizeCanvas();
+    F_initSim();
+    F_render();
+
+    const resizeObserver = new ResizeObserver(() => F_resizeCanvas());
+    resizeObserver.observe(canvas.parentElement);
+
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  /* ── Chart container resize tracking ── */
+  useEffect(() => {
+    const chartEl = V_chartRef.current;
+    if (!chartEl) return;
+    const ro = new ResizeObserver(entries => {
+      for (const entry of entries) {
+        setV_chartWidth(entry.contentRect.width - 20); // subtract padding
+      }
+    });
+    ro.observe(chartEl);
+    return () => ro.disconnect();
+  }, []);
+
+  /* ── Animation loop (supports fractional speeds) ── */
+  useEffect(() => {
+    if (!V_running) {
+      if (V_animFrameRef.current) cancelAnimationFrame(V_animFrameRef.current);
+      return;
+    }
+    let frameCount = 0;
+    const loop = () => {
+      const stepsPerFrame = P_simSpeed >= 1 ? P_simSpeed : 1;
+      const framesPerStep = P_simSpeed < 1 ? Math.round(1 / P_simSpeed) : 1;
+      frameCount++;
+      let continuing = true;
+      if (frameCount % framesPerStep === 0) {
+        for (let i = 0; i < stepsPerFrame; i++) {
+          continuing = F_stepSim();
+          if (!continuing) break;
+        }
+      }
+      F_render();
+      const sim = V_simRef.current;
+      if (sim) {
+        setV_tick(sim.V_tick);
+        setV_stats(sim.V_stats ? { ...sim.V_stats } : null);
+        setV_histBaseline([...sim.V_histBaseline]);
+        setV_histCrossDistrict([...sim.V_histCrossDistrict]);
+      }
+      if (continuing) V_animFrameRef.current = requestAnimationFrame(loop);
+      else setV_running(false);
+    };
+    V_animFrameRef.current = requestAnimationFrame(loop);
+    return () => { if (V_animFrameRef.current) cancelAnimationFrame(V_animFrameRef.current); };
+  }, [V_running, P_simSpeed, F_stepSim, F_render]);
+
+  /* ── UI event handlers ── */
+  const F_reset = () => { setV_running(false); setTimeout(() => { F_initSim(); F_render(); }, 30); };
+
+  const F_step = () => {
+    if (!V_simRef.current) F_initSim();
+    F_stepSim(); F_render();
+    const sim = V_simRef.current;
+    if (sim) {
+      setV_tick(sim.V_tick);
+      setV_stats(sim.V_stats ? { ...sim.V_stats } : null);
+      setV_histBaseline([...sim.V_histBaseline]);
+      setV_histCrossDistrict([...sim.V_histCrossDistrict]);
+    }
+  };
+
+  const F_clickCanvas = (e) => {
+    const canvas = V_canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const scale = Math.min((canvas.offsetWidth - 16) / P_TOTAL_PX, (canvas.offsetHeight - 8) / P_TOTAL_PX);
+    const ox = 8 + (canvas.offsetWidth - 16 - P_TOTAL_PX * scale) / 2;
+    for (let dr = 0; dr < P_GRID_SIZE; dr++) {
+      for (let dc = 0; dc < P_GRID_SIZE; dc++) {
+        const did = dr * P_GRID_SIZE + dc;
+        const dox = dc * (P_DIST_PX + P_ARTERIAL_W);
+        const doy = dr * (P_DIST_PX + P_ARTERIAL_W);
+        if (mx >= ox + (dox + P_RING_W) * scale && mx <= ox + (dox + P_RING_W + P_DIST_PX) * scale &&
+            my >= 4 + (doy + P_RING_W) * scale && my <= 4 + (doy + P_RING_W + P_DIST_PX) * scale) {
+          setV_selectedDistrict(prev => prev === did ? null : did);
+          return;
+        }
+      }
+    }
+    setV_selectedDistrict(null);
+  };
+
+  const F_saveScenario = () => {
+    const totalSchools = Object.values(P_schools).reduce((s, v) => s + v.size, 0);
+    setV_savedScenario({
+      stats: V_stats ? { ...V_stats } : null,
+      tick: V_tick,
+      label: `A · ${totalSchools} schools`
+    });
+  };
+
+  /* ═══════════════════════════════════════════════
+     STACKED AREA CHART
+     FIX 2.3: Pixel-based coordinates for legible text.
+     FIX 2.3: Fill-only areas (no outline strokes).
+     FIX 2.3: Proper stacking — red sits ON TOP of blue.
+     ═══════════════════════════════════════════════ */
+  const V_maxTick = Math.max(V_tick, 1);
+  const V_maxChartVal = Math.max(1, ...V_histBaseline.map((b, i) => b + (V_histCrossDistrict[i] || 0)).slice(0, V_maxTick + 1));
+  const V_totalBaseline = V_histBaseline.slice(0, V_maxTick + 1).reduce((s, v) => s + v, 0);
+  const V_totalCrossDist = V_histCrossDistrict.slice(0, V_maxTick + 1).reduce((s, v) => s + v, 0);
+  const S_netIncreasePct = V_totalBaseline > 0 ? ((V_totalCrossDist / V_totalBaseline) * 100).toFixed(0) : "0";
+
+  const chartW = V_chartWidth;           // Actual pixel width
+  const chartH = 200;                    // Chart SVG height in pixels
+  const chartLeft = 40;                  // Left margin for Y-axis labels
+  const chartRight = chartW - 10;        // Right edge
+  const chartTop = 16;                   // Top margin
+  const chartBottom = chartH - 36;       // Bottom margin for X-axis labels
+  const chartRange = chartBottom - chartTop;
+  const chartDataW = chartRight - chartLeft;
+
+  /** Convert a car count to a Y pixel */
+  const F_valToY = (val) => chartBottom - (val / V_maxChartVal) * chartRange;
+
+  /** Convert a tick index to an X pixel */
+  const F_tickToX = (tick) => chartLeft + (tick / P_TOTAL_TICKS) * chartDataW;
+
+  // Build point arrays at regular intervals
+  const chartStep = Math.max(1, Math.floor(P_TOTAL_TICKS / 300));
+  const V_baselinePoints = [];   // Blue: baseline only
+  const V_stackedPoints = [];    // Red top edge: baseline + cross-district
+
+  for (let i = 0; i <= Math.min(V_maxTick, P_TOTAL_TICKS - 1); i += chartStep) {
+    const x = F_tickToX(i);
+    const baseVal = V_histBaseline[i] || 0;
+    const crossVal = V_histCrossDistrict[i] || 0;
+    V_baselinePoints.push([x, F_valToY(baseVal)]);
+    V_stackedPoints.push([x, F_valToY(baseVal + crossVal)]);
+  }
+
+  const mu = "#5a5550"; // Muted text color
+
+  /* ═══════════════════════════════════════════════
+     RENDER UI
+     ═══════════════════════════════════════════════ */
+  return (
+    <div style={{ fontFamily: "'JetBrains Mono',monospace", background: "#111", color: "#ddd", height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      {/* ── Header ── */}
+      <div style={{ background: "#0a0a09", padding: "8px 14px", display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid #262320", flexShrink: 0 }}>
+        <div style={{ width: 8, height: 8, borderRadius: "50%", background: V_running ? "#22c55e" : "#ef4444" }} />
+        <span style={{ fontSize: 14, fontWeight: 700, color: "#f59e0b", letterSpacing: 2 }}>ABM</span>
+        <span style={{ fontSize: 14, letterSpacing: 1 }}>TRAFFIC SIM</span>
+        <span style={{ fontSize: 10, color: mu, padding: "2px 6px", background: "#1a1815", borderRadius: 2 }}>v2.2</span>
+        <div style={{ marginLeft: "auto", fontSize: 12, color: mu, display: "flex", gap: 12 }}>
+          <span style={{ color: "#f59e0b", fontWeight: 700, fontSize: 14 }}>{F_tickToTimeStr(V_tick)}</span>
+          <span>Tick {V_tick}/{P_TOTAL_TICKS}</span>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+        {/* ── LEFT: Map + Metrics + Chart ── */}
+        <div style={{ flex: "1 1 62%", display: "flex", flexDirection: "column" }}>
+          {/* Canvas */}
+          <div style={{ flex: "1 1 auto", minHeight: 0 }}>
+            <canvas ref={V_canvasRef} onClick={F_clickCanvas}
+              style={{ width: "100%", height: "100%", cursor: "crosshair", display: "block" }} />
+          </div>
+
+          {/* S_ Metrics strip (always visible) */}
+          <div style={{ flexShrink: 0, background: "#0a0a09", borderTop: "1px solid #262320", padding: "6px 10px", display: "flex", gap: 4, flexWrap: "wrap", fontSize: 11 }}>
+            <MetricBadge label="On Arterials" value={V_stats?.S_arterialNow ?? "—"} color="#f59e0b" />
+            <MetricBadge label="Peak" value={V_stats?.S_peakArterial ?? "—"} />
+            <MetricBadge label="Avg All" value={V_stats ? V_stats.S_avgTripAll + " min" : "—"} />
+            <MetricBadge label="Avg Arterial" value={V_stats ? V_stats.S_avgTripArterial + " min" : "—"} color="#ef4444" />
+            <MetricBadge label="Avg Local" value={V_stats ? V_stats.S_avgTripLocal + " min" : "—"} color="#9ca3af" />
+            <MetricBadge label="Avg Baseline" value={V_stats ? V_stats.S_avgTripBaseline + " min" : "—"} color="#3b82f6" />
+            <MetricBadge label="Done" value={V_stats ? `${V_stats.S_completedTrips}/${V_stats.S_totalTrips}` : "—"} />
+            <MetricBadge label="🔴 Bright" value={V_stats?.S_brightRedActive ?? 0} color="#ef4444" />
+            <MetricBadge label="🟤 Dark" value={V_stats?.S_darkRedActive ?? 0} color="#991b1b" />
+            <MetricBadge label="🔵 Base" value={V_stats?.S_blueActive ?? 0} color="#3b82f6" />
+            <MetricBadge label="⚪ Local" value={V_stats?.S_grayActive ?? 0} color="#9ca3af" />
+          </div>
+
+          {/* Stacked area chart (FIX 2.3: pixel-based, fill-only, properly stacked) */}
+          <div ref={V_chartRef} style={{ flexShrink: 0, padding: "4px 8px 6px", background: "#0a0a09", borderTop: "1px solid #262320" }}>
+            <div style={{ background: "#141210", border: "1px solid #262320", borderRadius: 4, padding: "8px 10px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                <span style={{ fontSize: 12, fontWeight: 700, color: mu, letterSpacing: 1 }}>ARTERIAL LOAD OVER TIME</span>
+                <span style={{ fontSize: 13, fontWeight: 700 }}>Net increase: <span style={{ color: V_totalCrossDist > 0 ? "#ef4444" : mu }}>+{S_netIncreasePct}%</span></span>
+              </div>
+              <svg width="100%" height={chartH} viewBox={`0 0 ${chartW} ${chartH}`} preserveAspectRatio="xMidYMid meet" style={{ display: "block" }}>
+                {/* Y-axis grid lines and labels */}
+                {[0, 0.25, 0.5, 0.75, 1].map((frac, i) => {
+                  const yPos = F_valToY(V_maxChartVal * frac);
+                  return <React.Fragment key={`y${i}`}>
+                    <line x1={chartLeft} y1={yPos} x2={chartRight} y2={yPos} stroke="#1e1c18" strokeWidth="1" />
+                    <text x={chartLeft - 4} y={yPos + 4} fill="#999" fontSize="11" fontFamily="monospace" textAnchor="end">{Math.round(V_maxChartVal * frac)}</text>
+                  </React.Fragment>;
+                })}
+
+                {/* X-axis grid lines and time labels */}
+                {[5.5, 6, 6.5, 7, 7.5, 8].map((hour, i) => {
+                  const xPos = F_tickToX(((hour - P_START_HOUR) * 60 / (P_TICK_SECONDS / 60)));
+                  const label = `${Math.floor(hour)}:${String((hour % 1) * 60).padStart(2, "0")}`;
+                  return <React.Fragment key={`x${i}`}>
+                    <line x1={xPos} y1={chartTop} x2={xPos} y2={chartBottom} stroke="#1e1c18" strokeWidth="1" />
+                    <text x={xPos} y={chartBottom + 16} fill="#999" fontSize="11" fontFamily="monospace" textAnchor="middle">{label}</text>
+                  </React.Fragment>;
+                })}
+
+                {/* LAYER 1: Blue filled area (baseline) — from x-axis up to baseline values */}
+                {V_baselinePoints.length > 1 && (
+                  <polygon
+                    points={`${V_baselinePoints[0][0]},${chartBottom} ${V_baselinePoints.map(p => p.join(",")).join(" ")} ${V_baselinePoints[V_baselinePoints.length - 1][0]},${chartBottom}`}
+                    fill="rgba(59,130,246,0.35)" stroke="none" />
+                )}
+
+                {/* LAYER 2: Red filled area (cross-district) — stacked ON TOP of blue.
+                    Bottom edge follows the baseline curve, top edge is the stacked total. */}
+                {V_stackedPoints.length > 1 && V_baselinePoints.length > 1 && (
+                  <polygon
+                    points={`${V_stackedPoints.map(p => p.join(",")).join(" ")} ${[...V_baselinePoints].reverse().map(p => p.join(",")).join(" ")}`}
+                    fill="rgba(239,68,68,0.4)" stroke="none" />
+                )}
+
+                {/* Current time marker */}
+                <line x1={F_tickToX(V_tick)} y1={chartTop} x2={F_tickToX(V_tick)} y2={chartBottom}
+                  stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="4,3" />
+
+                {/* Axis titles */}
+                <text x={chartLeft + chartDataW / 2} y={chartH - 4} fill="#777" fontSize="11" fontFamily="monospace" textAnchor="middle">Time (5:30 AM → 8:00 AM)</text>
+                <text x={chartLeft} y={chartTop - 4} fill="#777" fontSize="11" fontFamily="monospace">Cars on Arterials</text>
+              </svg>
+              <div style={{ display: "flex", gap: 14, marginTop: 4, fontSize: 11, color: mu }}>
+                <span><span style={{ display: "inline-block", width: 12, height: 4, background: "rgba(59,130,246,0.5)", marginRight: 4, verticalAlign: "middle" }} />Baseline</span>
+                <span><span style={{ display: "inline-block", width: 12, height: 4, background: "rgba(239,68,68,0.5)", marginRight: 4, verticalAlign: "middle" }} />Cross-district (+{S_netIncreasePct}%)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* ── RIGHT: All controls (single scrollable page) ── */}
+        <div style={{ flex: "0 0 300px", background: "#131210", borderLeft: "1px solid #262320", overflowY: "auto", padding: "8px 10px", fontSize: 11 }}>
+          {/* Action buttons */}
+          <div style={{ display: "flex", gap: 2, marginBottom: 6 }}>
+            <ActionBtn onClick={() => { if (!V_simRef.current || V_simRef.current.V_cars.every(c => c.done)) F_initSim(); setV_running(!V_running); }}
+              accent={V_running ? "#dc2626" : "#f59e0b"} label={V_running ? "⏸ PAUSE" : "▶ RUN"} />
+            <ActionBtn onClick={F_reset} label="↺ RESET" />
+            <ActionBtn onClick={F_step} label="→ STEP" />
+          </div>
+
+          {/* Speed selector */}
+          <div style={{ marginBottom: 6 }}>
+            <span style={{ fontSize: 11, color: mu }}>Speed: </span>
+            <select value={P_simSpeed} onChange={e => setP_simSpeed(Number(e.target.value))}
+              style={{ fontSize: 11, padding: "3px 6px", borderRadius: 3, border: "1px solid #262320", background: "#1a1815", color: "#ddd" }}>
+              <option value={0.25}>0.25× (very slow)</option>
+              <option value={0.5}>0.5× (slow)</option>
+              <option value={1}>1× (normal)</option>
+              <option value={2}>2× (fast)</option>
+              <option value={4}>4×</option>
+              <option value={8}>8×</option>
+              <option value={10}>10× (max)</option>
+            </select>
+          </div>
+
+          {/* Toggle buttons */}
+          <div style={{ display: "flex", gap: 3, marginBottom: 6 }}>
+            <button onClick={() => setP_allRedLights(!P_allRedLights)}
+              style={{ flex: 1, padding: 5, fontSize: 11, fontWeight: 700, background: P_allRedLights ? "#7f1d1d" : "#1a1815", color: P_allRedLights ? "#fca5a5" : mu, border: "1px solid #262320", borderRadius: 3, cursor: "pointer" }}>
+              {P_allRedLights ? "🔴 ALL RED ON" : "🚦 Normal TL"}
+            </button>
+            <button onClick={() => setP_randomSchoolLocs(!P_randomSchoolLocs)}
+              style={{ flex: 1, padding: 5, fontSize: 11, background: P_randomSchoolLocs ? "#1e3a2e" : "#1a1815", color: P_randomSchoolLocs ? "#86efac" : mu, border: "1px solid #262320", borderRadius: 3, cursor: "pointer" }}>
+              {P_randomSchoolLocs ? "🎲 Random locs" : "📍 Center locs"}
+            </button>
+            <button onClick={() => { setV_showRoadLabels(!V_showRoadLabels); setTimeout(() => F_render(), 30); }}
+              style={{ flex: 1, padding: 5, fontSize: 11, fontWeight: 700, background: V_showRoadLabels ? "#1e293b" : "#1a1815", color: V_showRoadLabels ? "#93c5fd" : mu, border: "1px solid #262320", borderRadius: 3, cursor: "pointer" }}>
+              {V_showRoadLabels ? "🏷️ Labels ON" : "🏷️ Labels"}
+            </button>
+          </div>
+
+          {/* Seed controls */}
+          <div style={{ marginBottom: 6, padding: "6px 8px", background: P_useFixedSeed ? "#1a1a0e" : "#1a1815", border: `1px solid ${P_useFixedSeed ? "#4a4520" : "#262320"}`, borderRadius: 4 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: P_useFixedSeed ? 5 : 0 }}>
+              <button onClick={() => setP_useFixedSeed(!P_useFixedSeed)}
+                style={{ padding: "4px 8px", fontSize: 10, fontWeight: 700, cursor: "pointer", borderRadius: 3, border: "none",
+                  background: P_useFixedSeed ? "#ca8a04" : "#333", color: P_useFixedSeed ? "#0a0a09" : "#888" }}>
+                {P_useFixedSeed ? "🔒 SEED LOCKED" : "🔓 Random seed"}
+              </button>
+              <span style={{ fontSize: 10, color: P_useFixedSeed ? "#ca8a04" : "#555" }}>
+                {P_useFixedSeed ? `Seed: ${P_seedValue}` : "Different each run"}
+              </span>
+            </div>
+            {P_useFixedSeed && (
+              <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
+                <input type="number" value={P_seedValue}
+                  onChange={e => setP_seedValue(parseInt(e.target.value) || 0)}
+                  style={{ flex: 1, fontSize: 11, padding: "4px 6px", borderRadius: 3, border: "1px solid #4a4520", background: "#141210", color: "#f59e0b", fontFamily: "monospace", width: 60 }} />
+                <button onClick={() => setP_seedValue(Math.floor(Math.random() * 99999))}
+                  style={{ padding: "4px 8px", fontSize: 10, fontWeight: 700, cursor: "pointer", borderRadius: 3, border: "1px solid #4a4520", background: "#1a1815", color: "#ca8a04" }}>
+                  NEW
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* P_ Population parameters */}
+          <SectionTitle>POPULATION</SectionTitle>
+          <ParamSlider label="Households / district" value={P_householdsPerDist} min={0} max={100} onChange={setP_householdsPerDist} />
+          <ParamSlider label="% school-age children" value={P_pctSchoolAge} min={0} max={100} onChange={setP_pctSchoolAge} />
+          <ParamSlider label="% drive to work after" value={P_pctGoWork} min={0} max={100} onChange={setP_pctGoWork} />
+
+          {/* P_ Traffic parameters */}
+          <SectionTitle>TRAFFIC</SectionTitle>
+          <ParamSlider label={`Baseline cars/min (≈${Math.round(P_baselineCarsPerMin * 150)} total)`} value={P_baselineCarsPerMin} min={0} max={10} onChange={setP_baselineCarsPerMin} step={0.5} />
+          <div style={{ marginBottom: 6 }}>
+            <span style={{ fontSize: 11, color: mu }}>Baseline flow: </span>
+            <select value={P_baselineFlowMode} onChange={e => setP_baselineFlowMode(e.target.value)}
+              style={{ fontSize: 11, padding: "3px 6px", borderRadius: 3, border: "1px solid #262320", background: "#1a1815", color: "#ddd" }}>
+              <option value="fixed">Fixed (evenly spaced)</option>
+              <option value="uniform">Uniform (random)</option>
+              <option value="lognormal">Log-Normal (early peak)</option>
+              <option value="reverse_lognormal">Reverse Log-Normal (late peak)</option>
+            </select>
+          </div>
+          <ParamSlider label="Traffic light cycle (min)" value={P_tlCycleMin} min={1} max={10} onChange={setP_tlCycleMin} />
+          <ParamSlider label="Out-of-district pref %" value={P_outOfDistPref} min={0} max={100} onChange={setP_outOfDistPref} />
+          <div style={{ marginBottom: 6 }}>
+            <span style={{ fontSize: 11, color: mu }}>Assignment: </span>
+            <select value={P_assignMode} onChange={e => setP_assignMode(e.target.value)}
+              style={{ fontSize: 11, padding: "3px 6px", borderRadius: 3, border: "1px solid #262320", background: "#1a1815", color: "#ddd" }}>
+              <option value="nearest">Nearest</option>
+              <option value="random">Random equal</option>
+            </select>
+          </div>
+
+          {/* School configuration */}
+          <SectionTitle>SCHOOLS {V_selectedDistrict !== null ? `· D${V_selectedDistrict + 1}` : ""}</SectionTitle>
+          {V_selectedDistrict !== null ? (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 2 }}>
+                {C_SCHOOL_TYPES.map(st => {
+                  const active = P_schools[V_selectedDistrict]?.has(st);
+                  return (
+                    <button key={st} onClick={() => F_toggleSchool(V_selectedDistrict, st)}
+                      style={{ padding: "6px 4px", fontSize: 11, fontWeight: 600, borderRadius: 3, cursor: "pointer",
+                        background: active ? C_SCHOOL_COLORS[st] : "#1a1815", color: active ? "#fff" : mu,
+                        border: `1px solid ${active ? "transparent" : "#262320"}`, opacity: active ? 1 : 0.5 }}>
+                      {active ? "✓ " : "✕ "}{C_SCHOOL_LABELS[st]}
+                    </button>
+                  );
+                })}
+              </div>
+              <div style={{ display: "flex", gap: 2, marginTop: 3 }}>
+                <button onClick={() => setP_schools(p => ({ ...p, [V_selectedDistrict]: new Set(C_SCHOOL_TYPES) }))}
+                  style={{ flex: 1, padding: 4, fontSize: 10, background: "#1a1815", border: "1px solid #262320", borderRadius: 2, cursor: "pointer", color: mu }}>Add All</button>
+                <button onClick={() => setP_schools(p => ({ ...p, [V_selectedDistrict]: new Set() }))}
+                  style={{ flex: 1, padding: 4, fontSize: 10, background: "#2a1111", border: "1px solid #7f1d1d", borderRadius: 2, cursor: "pointer", color: "#fca5a5" }}>Remove All</button>
+              </div>
+            </>
+          ) : (
+            <div style={{ color: mu, fontSize: 11, fontStyle: "italic", padding: "6px 0" }}>Click a district on the map</div>
+          )}
+
+          {/* School overview grid */}
+          <SectionTitle>OVERVIEW</SectionTitle>
+          <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "2px 6px", fontSize: 10, color: mu }}>
+            {Array.from({ length: 9 }, (_, i) => (
+              <React.Fragment key={i}>
+                <span style={{ color: V_selectedDistrict === i ? "#f59e0b" : mu, fontWeight: V_selectedDistrict === i ? 700 : 400 }}>D{i + 1}</span>
+                <span>{P_schools[i]?.size ? [...P_schools[i]].join(" ") : "—"}</span>
+              </React.Fragment>
+            ))}
+          </div>
+
+          {/* A/B Comparison */}
+          <SectionTitle>A/B COMPARE</SectionTitle>
+          <div style={{ display: "flex", gap: 2 }}>
+            <ActionBtn onClick={F_saveScenario} label="SAVE A" accent="#f59e0b" />
+            {V_savedScenario && <ActionBtn onClick={() => setV_showComparison(!V_showComparison)} label={V_showComparison ? "HIDE" : "COMPARE"} />}
+          </div>
+          {V_showComparison && V_savedScenario && V_stats && (
+            <div style={{ marginTop: 6, fontSize: 11 }}>
+              <div style={{ color: mu, marginBottom: 3 }}>{V_savedScenario.label} → current</div>
+              <CompareRow label="Peak arterial" a={V_savedScenario.stats?.S_peakArterial || 0} b={V_stats.S_peakArterial || 0} />
+              <CompareRow label="Avg trip (all)" a={parseFloat(V_savedScenario.stats?.S_avgTripAll || 0)} b={parseFloat(V_stats.S_avgTripAll || 0)} />
+              <CompareRow label="Avg (arterial)" a={parseFloat(V_savedScenario.stats?.S_avgTripArterial || 0)} b={parseFloat(V_stats.S_avgTripArterial || 0)} />
+              <CompareRow label="Avg (baseline)" a={parseFloat(V_savedScenario.stats?.S_avgTripBaseline || 0)} b={parseFloat(V_stats.S_avgTripBaseline || 0)} />
+            </div>
+          )}
+
+          {/* Model info footer */}
+          <div style={{ fontSize: 9, color: "#444", marginTop: 10, lineHeight: 1.6 }}>
+            ⚠ Change params → RESET to apply<br />
+            5:30–8:00 AM · 1 tick = {P_TICK_SECONDS}s · {P_TOTAL_TICKS} ticks<br />
+            Free: {P_FREE_SPEED_KMH}km/h · Min: ~{Math.round(P_FREE_SPEED_KMH * P_MIN_SPEED_FACTOR)}km/h<br />
+            TL: {P_tlCycleMin}min = {Math.round(P_tlCycleMin * 60 / P_TICK_SECONDS)} ticks/cycle<br />
+            Departure: Normal dist (earlier = more children)
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════
+   REUSABLE UI COMPONENTS
+   ═══════════════════════════════════════════════ */
+
+/** ActionBtn: Styled button for simulation controls */
+function ActionBtn({ onClick, label, accent }) {
+  return (
+    <button onClick={onClick}
+      style={{ flex: 1, padding: "7px 0", fontSize: 11, fontWeight: 700, letterSpacing: 0.5, cursor: "pointer",
+        background: accent || "#1a1815", color: accent ? "#0a0a09" : "#999",
+        border: accent ? "none" : "1px solid #262320", borderRadius: 3 }}>
+      {label}
+    </button>
+  );
+}
+
+/** ParamSlider: Labeled range slider for P_ parameters */
+function ParamSlider({ label, value, min, max, onChange, color = "#f59e0b", step = 1 }) {
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#6b6560", marginBottom: 2 }}>
+        <span>{label}</span>
+        <span style={{ fontWeight: 700, color: "#ddd" }}>{value}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        style={{ width: "100%", accentColor: color, height: 4 }} />
+    </div>
+  );
+}
+
+/** SectionTitle: Section header in the control panel */
+function SectionTitle({ children }) {
+  return (
+    <div style={{ fontWeight: 700, fontSize: 10, color: "#555", letterSpacing: 1,
+      marginTop: 10, marginBottom: 4, paddingBottom: 2, borderBottom: "1px solid #262320" }}>
+      {children}
+    </div>
+  );
+}
+
+/** MetricBadge: Small badge showing a live metric value */
+function MetricBadge({ label, value, color }) {
+  return (
+    <div style={{ background: "#141210", border: "1px solid #1e1c18", borderRadius: 3,
+      padding: "3px 6px", display: "flex", gap: 4, alignItems: "center" }}>
+      <span style={{ color: "#666", fontSize: 10 }}>{label}</span>
+      <span style={{ fontWeight: 700, color: color || "#ddd", fontSize: 12 }}>{value}</span>
+    </div>
+  );
+}
+
+/** CompareRow: Single row in A/B comparison showing delta percentage */
+function CompareRow({ label, a, b }) {
+  const delta = b - a;
+  const pct = a > 0 ? ((delta / a) * 100).toFixed(1) : "—";
+  const color = delta > 0 ? "#ef4444" : delta < 0 ? "#22c55e" : "#555";
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "2px 0", fontSize: 11, color: "#6b6560" }}>
+      <span>{label}</span>
+      <span>{a} → {b} <span style={{ color, fontWeight: 700 }}>({delta > 0 ? "+" : ""}{pct}%)</span></span>
+    </div>
+  );
+}
+
+
+    // Mount
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(React.createElement(ABMTrafficSimulator));
+  </script>
+</body>
+</html>
